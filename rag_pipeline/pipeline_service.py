@@ -129,7 +129,6 @@ class SarRagService:
             if "cuda" not in message and "gpu" not in message:
                 raise
 
-            # Fallback path for environments where GPU runner is unavailable or unstable.
             fallback_options = dict(model_options)
             fallback_options["num_gpu"] = 0
             return ollama.chat(
@@ -219,6 +218,8 @@ class SarRagService:
         )
 
         prompt_payload = self._build_prompt_bundle(masked_alert, evidence_blocks, retrieval_payload)
+
+        # ── CHANGE 3: generate with one automatic retry if word count is too low ──
         raw_response = self._chat_with_fallback(
             model_name=self.model_name,
             system_prompt=prompt_payload["system_prompt"],
@@ -226,6 +227,17 @@ class SarRagService:
             model_options=prompt_payload["model_options"],
         )
         narrative = self._post_process_narrative(raw_response["message"]["content"], alert)
+
+        if len(narrative.split()) < 280:
+            raw_response = self._chat_with_fallback(
+                model_name=self.model_name,
+                system_prompt=prompt_payload["system_prompt"],
+                user_prompt=prompt_payload["user_prompt"],
+                model_options=prompt_payload["model_options"],
+            )
+            narrative = self._post_process_narrative(raw_response["message"]["content"], alert)
+        # ── end CHANGE 3 ──
+
         sentence_traceability = self._build_sentence_traceability(
             narrative,
             evidence_blocks,
@@ -391,6 +403,10 @@ class SarRagService:
             "time_window_days": transactions["time_window_days"],
             "average_transaction_amount": avg_amount,
             "destination_country": transactions.get("destination_country", "DOMESTIC"),
+            # ── CHANGE 2: include velocity in transaction details ──
+            "txn_per_day": round(
+                transactions["transaction_count"] / max(transactions["time_window_days"], 1), 1
+            ),
         }
         for optional_key in ["min_transaction_amount", "max_transaction_amount", "reporting_threshold"]:
             if optional_key in transactions:
@@ -402,6 +418,9 @@ class SarRagService:
             return None
 
         financials = copy.deepcopy(alert["customer_financials"])
+        # ── CHANGE 3 (part): strip None values so they never reach the prompt ──
+        financials = {k: v for k, v in financials.items() if v is not None}
+
         avg_monthly = financials.get("avg_monthly_deposits_12m")
         if avg_monthly:
             deviation = round(((alert["transactions"]["total_amount"] - avg_monthly) / avg_monthly) * 100, 1)
@@ -421,6 +440,12 @@ class SarRagService:
                 f"- {block['rule_id']} ({block['rule_name']}): {block['observation']} [confidence: {block['confidence']}] — {block['audit_reason']['why_flagged']}"
                 for block in evidence_blocks
             ]
+        )
+
+        # ── CHANGE 1: build a formatted rule list for paragraph 4 ──
+        rule_list_for_p4 = ", ".join(
+            f"{block['rule_name']} ({block['rule_id']})"
+            for block in evidence_blocks
         )
 
         context_parts = []
@@ -445,6 +470,8 @@ class SarRagService:
             f"- Time Window           : {transaction_details['time_window_days']} days",
             f"- Average Txn Amount    : INR {transaction_details['average_transaction_amount']}",
             f"- Destination Country   : {transaction_details['destination_country']}",
+            # ── CHANGE 2: velocity line added to prompt data ──
+            f"- Transaction Velocity  : {transaction_details['txn_per_day']} txn/day (institutional threshold: 5 txn/day)",
         ]
         if "min_transaction_amount" in transaction_details:
             transaction_lines.append(f"- Min Transaction       : INR {transaction_details['min_transaction_amount']}")
@@ -486,14 +513,15 @@ WRITING STYLE:
 - Past tense
 - Professional compliance tone
 - All monetary amounts prefixed with INR
-- Length between 250 and 350 words
+- Length between 280 and 380 words
+- Never write data labels like "Total inbound:" or "Residual balance:" — always write full sentences
 
 FIVE PARAGRAPH STRUCTURE:
 Paragraph 1: filing institution, account type, customer profile, alert type, monitoring period.
-Paragraph 2: suspicious transaction behaviour using only total amount, time window, destination country.
-Paragraph 3: transaction count, total amount, average transaction amount, and financial deviation if provided.
-Paragraph 4: reason for suspicion, the exact typology name, and the triggered rules.
-Paragraph 5: filing decision, applicable regulation, and enhanced monitoring.
+Paragraph 2: suspicious transaction behaviour using only total amount, time window, destination country. End with a sentence describing the near-zero residual balance and pass-through mechanism.
+Paragraph 3: deviation from baseline percentage, average transaction amount vs reporting threshold, AND the transaction velocity ({transaction_details['txn_per_day']} txn/day) vs the institutional threshold of 5 txn/day.
+Paragraph 4: reason for suspicion, the exact typology name, AND name the following triggered rules explicitly by name and ID: {rule_list_for_p4}.
+Paragraph 5: filing decision citing PMLA Section 12, enhanced monitoring, FIU escalation, and source of funds request.
 """
 
         user_prompt = "\n".join(
@@ -513,6 +541,9 @@ Paragraph 5: filing decision, applicable regulation, and enhanced monitoring.
                 "- No customer name, customer ID, or account number anywhere.",
                 "- No placeholder text in square brackets.",
                 "- No paragraph labels or closing note after paragraph 5.",
+                f"- Paragraph 3 must state the {transaction_details['txn_per_day']} txn/day velocity and how it exceeds the 5 txn/day threshold.",
+                f"- Paragraph 4 must name these rules: {rule_list_for_p4}.",
+                "- Minimum 280 words total.",
             ]
         )
 
@@ -640,11 +671,19 @@ Paragraph 5: filing decision, applicable regulation, and enhanced monitoring.
             allowed_numbers.add(str(alert["transactions"]["reporting_threshold"]))
         if "customer_financials" in alert:
             for value in alert["customer_financials"].values():
-                allowed_numbers.add(str(value))
+                if value is not None:
+                    allowed_numbers.add(str(value))
             avg_monthly = alert["customer_financials"].get("avg_monthly_deposits_12m")
             if avg_monthly:
                 deviation = round(((alert["transactions"]["total_amount"] - avg_monthly) / avg_monthly) * 100, 1)
                 allowed_numbers.add(str(deviation))
+
+        # ── CHANGE 2: allow velocity figure in narrative ──
+        txn_per_day = round(
+            alert["transactions"]["transaction_count"] / max(alert["transactions"]["time_window_days"], 1), 1
+        )
+        allowed_numbers.add(str(txn_per_day))
+        allowed_numbers.add("5")  # institutional velocity threshold
 
         checks = [
             {
@@ -653,8 +692,9 @@ Paragraph 5: filing decision, applicable regulation, and enhanced monitoring.
                 "details": f"Found {len(paragraphs)} paragraphs.",
             },
             {
+                # ── CHANGE 3: raised minimum word count from 250 to 280 ──
                 "name": "word_count_range",
-                "passed": 250 <= len(words) <= 350,
+                "passed": 280 <= len(words) <= 400,
                 "details": f"Narrative contains {len(words)} words.",
             },
             {
