@@ -1,0 +1,16 @@
+{
+  "alert_id": "ALERT_FP_TOTAL_001",
+  "customer_id": "CUST_1003",
+  "alert_type": "WIRE_TRANSFER",
+  "asset_type": "FIAT_WIRE",
+  "pattern": "deposit aggregation",
+  "alert_window_start": "2026-03-24T00:00:00Z",
+  "alert_window_end": "2026-03-26T23:59:59Z",
+  "transactions": {
+    "transaction_count": 2,
+    "total_amount": 42000.0,
+    "time_window_days": 3,
+    "destination_country": "INDIA",
+    "reporting_threshold": 1000000
+  }
+}

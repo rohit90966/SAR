@@ -1,16 +1,16 @@
 {
-  "alert_id": "ALERT_7821",
+  "alert_id": "ALERT_FP_INTERMEDIATE_001",
   "customer_id": "CUST_1001",
   "alert_type": "Layering",
   "asset_type": "FIAT_WIRE",
-  "pattern": "multiple accounts round trip layering structuring",
+  "pattern": "structuring signals",
   "alert_window_start": "2026-03-24T00:00:00Z",
   "alert_window_end": "2026-03-26T23:59:59Z",
   "transactions": {
-    "transaction_count": 57,
-    "total_amount": 1623211.99,
+    "transaction_count": 12,
+    "total_amount": 180000.0,
     "time_window_days": 3,
-    "destination_country": "UAE",
+    "destination_country": "INDIA",
     "reporting_threshold": 1000000
   }
 }

@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from jose import JWTError, jwt
 from pydantic import BaseModel
 from reportlab.lib import colors
@@ -27,12 +27,32 @@ from reportlab.platypus import (
 load_dotenv()
 
 from rag_pipeline.pipeline_service import SarRagService, build_text_diff, mask_alert
+from rag_pipeline.ingestion_pipeline import ingest_regulation_document
+from rag_pipeline.rule_engine import load_rule_config
 from .enrichment import enrich_case
+from .regulation_engine import (
+    check_regulatory_readiness,
+    process_regulation_document,
+    apply_threshold_updates,
+    activate_asset_type_in_registry,
+    get_registry,
+)
 from .database import (
     append_audit_event, create_case, get_audit_events,
     get_case, init_db, list_cases, update_case,
+    quarantine_alert, release_quarantined_alerts,
+    list_quarantine_queue, create_staging_entry,
+    get_staging_entry, update_staging_status,
+    list_staging_entries,
+    record_alert_disposition,
+    get_historical_fp_rate,
+    record_customer_sar_approval,
+    get_full_customer_kyc,
+    get_customer,
+    get_accounts_for_customer,
 )
-from .schemas import AlertPayload, ReplayResponse, ReviewRequest
+from .false_alert_filter import score_false_alert_probability
+from .schemas import AlertPayload, ReplayResponse, ReviewRequest, RegulationUploadRequest, StagingReviewRequest
 
 app = FastAPI(title="SAR Narrative Generator API", version="2.0.0")
 
@@ -165,11 +185,10 @@ def enrich_narrative_with_pii(narrative: str, alert_payload: dict[str, Any]) -> 
     customer_name    = str(alert_payload.get("customer_name") or "N/A")
     account_type     = str(alert_payload.get("account_type") or "N/A")
 
+    # BUG WARN #5 FIX: removed r"\ba\s+student\b" replacement
+    # customer_profile != occupation — do not conflate them
     replacements = [
-        (r"\bthe\s+account\s+holder\b", customer_name),
-        (r"\bthe\s+subject\b",           customer_name),
-        (r"\bthe\s+customer\b",          customer_name),
-        (r"\ba\s+savings\s+account\b",   f"{account_type} account"),
+        (r"\ba\s+savings\s+account\b", f"{account_type} account"),
     ]
 
     enriched = narrative or ""
@@ -283,21 +302,31 @@ def _risk_color(risk_level: str) -> colors.Color:
     return colors.black
 
 
-def _draw_footer(canvas_obj: canvas.Canvas, _: Any) -> None:
-    canvas_obj.saveState()
-    footer_gray = colors.HexColor("#6C757D")
-    y_line = 1.7 * cm
-    canvas_obj.setStrokeColor(footer_gray)
-    canvas_obj.setLineWidth(0.5)
-    canvas_obj.line(2 * cm, y_line, A4[0] - (2 * cm), y_line)
-    canvas_obj.setFillColor(footer_gray)
-    canvas_obj.setFont("Helvetica", 8)
-    canvas_obj.drawString(2 * cm, 1.15 * cm, "CONFIDENTIAL - NOT FOR DISTRIBUTION")
-    canvas_obj.drawCentredString(
-        A4[0] / 2, 1.15 * cm,
-        "SAR Narrative Generator - Barclays Hack-O-Hire 2026",
-    )
-    canvas_obj.restoreState()
+def _make_footer(decision: str):
+    dec = (decision or "PENDING").upper()
+    if dec == "APPROVE":
+        label = "Reviewed and APPROVED by qualified compliance analyst"
+    elif dec in ("REJECT", "REJECTED"):
+        label = "Reviewed and REJECTED by qualified compliance analyst"
+    else:
+        label = "Pending analyst review"
+
+    def _draw_footer(canvas_obj: canvas.Canvas, _: Any) -> None:
+        canvas_obj.saveState()
+        footer_gray = colors.HexColor("#6C757D")
+        y_line = 1.7 * cm
+        canvas_obj.setStrokeColor(footer_gray)
+        canvas_obj.setLineWidth(0.5)
+        canvas_obj.line(2 * cm, y_line, A4[0] - (2 * cm), y_line)
+        canvas_obj.setFillColor(footer_gray)
+        canvas_obj.setFont("Helvetica", 8)
+        canvas_obj.drawString(2 * cm, 1.15 * cm, "CONFIDENTIAL - NOT FOR DISTRIBUTION")
+        canvas_obj.drawCentredString(
+            A4[0] / 2, 1.15 * cm,
+            f"SAR Narrative Generator - Barclays Hack-O-Hire 2026 | {label}",
+        )
+        canvas_obj.restoreState()
+    return _draw_footer
 
 
 def _build_txn_table(
@@ -418,19 +447,86 @@ def _build_pdf(case_record: dict[str, Any]) -> bytes:
     retrieval_payload  = case_record.get("retrieval_payload") or {}
     enrichment_payload = case_record.get("enrichment_payload") or {}
 
+    # PII-sealed enrichment data (transaction rows, account dates, etc.)
+    pii_sealed = enrichment_payload.get("pii_sealed") or {}
+
+    # Fetch canonical customer fields from DB as a final fallback.
+    customer_id_raw = alert_payload.get("customer_id") or final_sar.get("customer_id")
+    kyc_record: dict[str, Any] = {}
+    basic_customer: dict[str, Any] = {}
+    customer_accounts: list[dict[str, Any]] = []
+    if customer_id_raw:
+        try:
+            kyc_record = get_full_customer_kyc(str(customer_id_raw)) or {}
+        except Exception:
+            kyc_record = {}
+        try:
+            basic_customer = get_customer(str(customer_id_raw)) or {}
+        except Exception:
+            basic_customer = {}
+        try:
+            customer_accounts = get_accounts_for_customer(str(customer_id_raw)) or []
+        except Exception:
+            customer_accounts = []
+
+    db_account_types = kyc_record.get("account_types") or []
+    db_primary_account_type = (
+        str(db_account_types[0])
+        if db_account_types
+        else (str(customer_accounts[0].get("account_type")) if customer_accounts else None)
+    )
+
+    db_earliest_account = kyc_record.get("earliest_account_date")
+    if not db_earliest_account and customer_accounts:
+        opened_dates = [a.get("opened_date") for a in customer_accounts if a.get("opened_date")]
+        if opened_dates:
+            try:
+                db_earliest_account = min(opened_dates)
+            except Exception:
+                db_earliest_account = opened_dates[0]
+    if db_earliest_account:
+        try:
+            account_opened_date_db = db_earliest_account.strftime("%d %b %Y")
+        except Exception:
+            account_opened_date_db = str(db_earliest_account)
+    else:
+        account_opened_date_db = None
+
     # PII fields from alert_payload — reinserted at export time
-    customer_name    = _safe_value(alert_payload.get("customer_name"))
-    customer_id      = _safe_value(alert_payload.get("customer_id"))
-    account_type     = _safe_value(alert_payload.get("account_type"))
+    customer_name    = _safe_value(
+        alert_payload.get("customer_name")
+        or pii_sealed.get("customer_name")
+        or kyc_record.get("name")
+        or basic_customer.get("name")
+    )
+    customer_id      = _safe_value(customer_id_raw)
+    account_type     = _safe_value(
+        alert_payload.get("account_type") or db_primary_account_type
+    )
     alert_id         = _safe_value(alert_payload.get("alert_id") or case_record.get("alert_id"))
     alert_type       = _safe_value(alert_payload.get("alert_type") or final_sar.get("alert_type"))
-    customer_profile = _safe_value(alert_payload.get("customer_profile"))
+    customer_profile = _safe_value(
+        alert_payload.get("customer_profile")
+        or pii_sealed.get("occupation")
+        or kyc_record.get("occupation")
+        or basic_customer.get("occupation")
+    )
 
     transactions        = alert_payload.get("transactions") or {}
+    txn_details = evidence_pack.get("transaction_details") or {}
     total_amount        = _safe_value(transactions.get("total_amount"))
     transaction_count   = _safe_value(transactions.get("transaction_count"))
     time_window_days    = _safe_value(transactions.get("time_window_days"))
     destination_country = _safe_value(transactions.get("destination_country"))
+
+    if total_amount == "N/A":
+        total_amount = _safe_value(txn_details.get("total_amount"))
+    if transaction_count == "N/A":
+        transaction_count = _safe_value(txn_details.get("transaction_count"))
+    if time_window_days == "N/A":
+        time_window_days = _safe_value(txn_details.get("time_window_days"))
+    if destination_country == "N/A":
+        destination_country = _safe_value(txn_details.get("destination_country"))
 
     risk_level = _safe_value(case_record.get("risk_level") or final_sar.get("risk_level"))
     risk_score = case_record.get("risk_score")
@@ -441,14 +537,28 @@ def _build_pdf(case_record: dict[str, Any]) -> bytes:
 
     generated_date = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-    # PII-sealed enrichment data (transaction rows, account dates, etc.)
-    pii_sealed = enrichment_payload.get("pii_sealed") or {}
     txn_table_rows  = pii_sealed.get("txn_table_rows") or []
-    alert_window_start_fmt = pii_sealed.get("alert_window_start_fmt") or "N/A"
-    alert_window_end_fmt   = pii_sealed.get("alert_window_end_fmt") or "N/A"
-    occupation             = pii_sealed.get("occupation") or "N/A"
-    risk_rating_kyc        = pii_sealed.get("risk_rating") or "N/A"
-    account_opened_date    = pii_sealed.get("account_opened_date") or "N/A"
+    alert_window_start_fmt = (
+        pii_sealed.get("alert_window_start_fmt")
+        or _safe_value(alert_payload.get("alert_window_start"))
+    )
+    alert_window_end_fmt = (
+        pii_sealed.get("alert_window_end_fmt")
+        or _safe_value(alert_payload.get("alert_window_end"))
+    )
+    occupation             = (
+        pii_sealed.get("occupation")
+        or kyc_record.get("occupation")
+        or basic_customer.get("occupation")
+        or "N/A"
+    )
+    risk_rating_kyc        = (
+        pii_sealed.get("risk_rating")
+        or kyc_record.get("risk_rating")
+        or basic_customer.get("risk_rating")
+        or "N/A"
+    )
+    account_opened_date    = pii_sealed.get("account_opened_date") or account_opened_date_db or "N/A"
 
     # Safe stats for display
     safe_stats = enrichment_payload.get("safe_stats") or {}
@@ -470,8 +580,9 @@ def _build_pdf(case_record: dict[str, Any]) -> bytes:
         leftMargin=2*cm, rightMargin=2*cm,
         topMargin=2*cm,  bottomMargin=2*cm,
     )
+    decision = _safe_value((case_record.get("analyst_review") or {}).get("decision") or "PENDING")
     frame = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id="content")
-    doc.addPageTemplates([PageTemplate(id="with-footer", frames=[frame], onPage=_draw_footer)])
+    doc.addPageTemplates([PageTemplate(id="with-footer", frames=[frame], onPage=_make_footer(decision))])
 
     flow: list[Any] = []
     W = doc.width  # shorthand for doc width
@@ -812,38 +923,149 @@ def create_new_case(
     _: dict[str, str] = Depends(get_current_user),
 ) -> dict[str, Any]:
     alert_payload = serialise(alert)
+    asset_type = alert_payload.get("asset_type", "FIAT_WIRE")
+
+    # ── REGULATORY PRE-FLIGHT CHECK ──────────────────────────────────────
+    readiness = check_regulatory_readiness(asset_type)
+
+    if not readiness["ready"]:
+        quarantine_id = str(uuid4())
+        quarantine_alert(
+            quarantine_id=quarantine_id,
+            alert_payload=alert_payload,
+            asset_type=asset_type,
+            reason=readiness["message"],
+            missing_items=readiness["missing"],
+        )
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "QUARANTINED",
+                "quarantine_id": quarantine_id,
+                "asset_type": asset_type,
+                "regulatory_status": readiness["status"],
+                "missing": readiness["missing"],
+                "message": readiness["message"],
+                "action_required": (
+                    f"Upload the governing regulation document via "
+                    f"POST /regulations/upload with asset_type='{asset_type}'. "
+                    f"Once activated, this alert will be automatically reprocessed."
+                ),
+                "alert_id": alert_payload.get("alert_id"),
+                "quarantined_at": utc_now(),
+            },
+        )
+
+    # Regulatory framework confirmed active — proceed
     case_id = str(uuid4())
     masked_alert_payload = mask_alert(alert_payload)
     create_case(case_id, alert_payload, masked_alert_payload)
 
-    # ── Enrichment Step ──────────────────────────────────────────────────
-    # Fetch KYC and transaction data from PostgreSQL.
-    # safe_stats are merged into alert_payload["customer_financials"]
-    # so the pipeline can use them without any changes.
-    # pii_sealed is stored separately and never crosses the PII boundary.
+    # ── FALSE ALERT FILTER ────────────────────────────────────────────────
+    # Run the rule engine early to get evidence_blocks for scoring.
+    # We need these BEFORE enrichment so we can decide whether to
+    # run enrichment at all. The rule engine is cheap - it reads from
+    # the already-cached rules.yaml and does pure in-memory math.
+    # Note: service.process_alert() will call evaluate_rules() again
+    # internally - that is intentional. The second call uses the
+    # enriched alert_payload with customer_financials added, which
+    # may cause additional rules to fire. The pre-filter call here
+    # uses the raw alert_payload only for verdict scoring.
+    from rag_pipeline.rule_engine import evaluate_rules as _evaluate_rules_early
+    early_evidence_blocks = _evaluate_rules_early(alert_payload)
+
+    fp_result = score_false_alert_probability(alert_payload, early_evidence_blocks)
+    update_case(case_id, false_alert_score=fp_result)
+
+    append_audit_event(case_id, "FALSE_ALERT_SCORED", {
+        "verdict": fp_result["verdict"],
+        "true_positive_score": fp_result["true_positive_score"],
+        "signals": fp_result["signals"],
+        "rule_ids_evaluated": fp_result["rule_ids_evaluated"],
+        "threshold_rules_fired": fp_result["threshold_rules_fired"],
+        "keyword_rules_fired": fp_result["keyword_rules_fired"],
+        "recommendation": fp_result["recommendation"],
+    })
+
+    if fp_result["verdict"] == "LIKELY_FALSE":
+        # Auto-close - stop here, nothing expensive runs.
+        record_alert_disposition(
+            case_id=case_id,
+            rule_ids=fp_result["rule_ids_evaluated"],
+            customer_profile=fp_result.get("customer_profile_used") or alert_payload.get("customer_profile", ""),
+            disposition="FALSE_POSITIVE",
+            disposed_by="AUTO_FILTER",
+        )
+        update_case(case_id, status="AUTO_CLOSED_FALSE_POSITIVE")
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "AUTO_CLOSED_FALSE_POSITIVE",
+                "case_id": case_id,
+                "alert_id": alert_payload.get("alert_id"),
+                "verdict": fp_result["verdict"],
+                "true_positive_score": fp_result["true_positive_score"],
+                "signals": fp_result["signals"],
+                "rule_ids_evaluated": fp_result["rule_ids_evaluated"],
+                "recommendation": fp_result["recommendation"],
+                "message": (
+                    "Alert scored as likely false positive and auto-closed. "
+                    "No enrichment, LLM generation, or ChromaDB retrieval was performed. "
+                    "Disposition recorded for feedback loop improvement."
+                ),
+            },
+        )
+
+    elif fp_result["verdict"] == "BORDERLINE":
+        # Send to triage - analyst reviews rule summary, no LLM runs.
+        update_case(case_id, status="PENDING_TRIAGE")
+        append_audit_event(case_id, "SENT_TO_TRIAGE", {
+            "reason": "False alert score in borderline range",
+            "score": fp_result["true_positive_score"],
+            "signals": fp_result["signals"],
+        })
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "PENDING_TRIAGE",
+                "case_id": case_id,
+                "alert_id": alert_payload.get("alert_id"),
+                "verdict": fp_result["verdict"],
+                "true_positive_score": fp_result["true_positive_score"],
+                "signals": fp_result["signals"],
+                "rule_summary": [
+                    {
+                        "rule_id": b["rule_id"],
+                        "rule_name": b["rule_name"],
+                        "confidence": b["confidence"],
+                        "observation": b["observation"],
+                        "why_flagged": b["audit_reason"]["why_flagged"],
+                    }
+                    for b in early_evidence_blocks
+                ],
+                "recommendation": fp_result["recommendation"],
+                "message": (
+                    "Alert sent to analyst triage queue. "
+                    "No LLM narrative was generated. "
+                    "Analyst can escalate to full pipeline or close as false positive."
+                ),
+            },
+        )
+
+    # LIKELY_TRUE - fall through to full pipeline below.
+    # ── END FALSE ALERT FILTER ────────────────────────────────────────────
+
+    # ── Enrichment ───────────────────────────────────────────────────────
     enrichment_result = enrich_case(alert_payload)
 
     if enrichment_result.get("enriched"):
         safe_stats = enrichment_result["safe_stats"]
-        # Merge safe_stats into alert_payload as customer_financials
-        # This is the ONLY crossing point — safe, anonymised stats only
         alert_payload["customer_financials"] = {
-            "declared_monthly_income":      safe_stats.get("declared_monthly_income"),
-            "avg_monthly_deposits_12m":     safe_stats.get("avg_monthly_deposits_12m"),
+            "declared_monthly_income":       safe_stats.get("declared_monthly_income"),
+            "avg_monthly_deposits_12m":      safe_stats.get("avg_monthly_deposits_12m"),
             "historical_baseline_txn_count": safe_stats.get("historical_baseline_txn_count"),
-            "deviation_from_baseline_pct":  safe_stats.get("deviation_from_baseline_pct"),
+            "deviation_from_baseline_pct":   safe_stats.get("deviation_from_baseline_pct"),
         }
-        alert_payload["transactions"]["transaction_count"] = len(
-            enrichment_result["pii_sealed"].get("txn_table_rows", [])
-        )
-        alert_payload["transactions"]["total_amount"] = round(
-            sum(
-                float(r["amount"]) for r in enrichment_result["pii_sealed"].get("txn_table_rows", [])
-                if r.get("txn_type") == "credit"
-            ), 2
-        )
-        # Also pass counterparty context as extra alert fields
-        # These flow into the prompt as additional data lines
         alert_payload["_enrichment_context"] = {
             "unique_counterparties_count": safe_stats.get("unique_counterparties_count"),
             "new_counterparties_count":    safe_stats.get("new_counterparties_count"),
@@ -851,6 +1073,19 @@ def create_new_case(
             "alert_date_range_start":      safe_stats.get("alert_date_range_start"),
             "alert_date_range_end":        safe_stats.get("alert_date_range_end"),
         }
+        alert_payload["_customer_background"] = enrichment_result.get(
+            "customer_background", {}
+        )
+
+        # BUG #3 FIX: overwrite stale JSON counts with DB-derived values
+        txn_rows = enrichment_result["pii_sealed"].get("txn_table_rows", [])
+        alert_payload["transactions"]["transaction_count"] = len(txn_rows)
+        alert_payload["transactions"]["total_amount"] = round(
+            sum(
+                float(r["amount"]) for r in txn_rows
+                if r.get("txn_type") == "credit"
+            ), 2,
+        )
 
         append_audit_event(case_id, "ENRICHMENT_COMPLETED", {
             "enriched": True,
@@ -859,27 +1094,28 @@ def create_new_case(
             "deviation_pct": safe_stats.get("deviation_from_baseline_pct"),
             "unique_counterparties": safe_stats.get("unique_counterparties_count"),
             "new_counterparties": safe_stats.get("new_counterparties_count"),
-            "txn_bucket_counts": {
-                "high_velocity": len(enrichment_result["pii_sealed"].get("txn_buckets", {}).get("high_velocity_txns", [])),
-                "uae_transfers": len(enrichment_result["pii_sealed"].get("txn_buckets", {}).get("uae_transfers", [])),
-                "structuring":   len(enrichment_result["pii_sealed"].get("txn_buckets", {}).get("structuring_txns", [])),
-            },
+            "db_transaction_count": len(txn_rows),
         })
+        update_case(case_id, alert_payload=alert_payload)
     else:
-        # Enrichment not available — fall back to alert_payload customer_financials if present
         append_audit_event(case_id, "ENRICHMENT_SKIPPED", {
             "enriched": False,
             "reason": enrichment_result.get("error") or "No enrichment data found.",
-            "fallback": "Using customer_financials from alert payload if provided.",
         })
 
-    # ── Pipeline Processing ───────────────────────────────────────────────
+    # ── Pipeline ─────────────────────────────────────────────────────────
     try:
+        from .regulation_engine import get_registry
+        alert_payload["_registry_config"] = get_registry()
         result = service.process_alert(alert_payload)
     except Exception as exc:
         update_case(case_id, status="FAILED")
-        append_audit_event(case_id, "CASE_FAILED", {"error": str(exc), "failed_at": utc_now()})
-        raise HTTPException(status_code=500, detail=f"Case processing failed: {exc}") from exc
+        append_audit_event(case_id, "CASE_FAILED", {
+            "error": str(exc), "failed_at": utc_now()
+        })
+        raise HTTPException(
+            status_code=500, detail=f"Case processing failed: {exc}"
+        ) from exc
 
     update_case(
         case_id,
@@ -893,8 +1129,6 @@ def create_new_case(
         prompt_payload=result["prompt_payload"],
         validation_payload=result["validation_payload"],
         final_sar=result["final_sar"],
-        # Store enrichment_payload for PDF export
-        # pii_sealed fields (txn table, dates) used only at export time
         enrichment_payload=enrichment_result,
     )
 
@@ -903,7 +1137,9 @@ def create_new_case(
 
     case_record = get_case(case_id)
     if case_record is None:
-        raise HTTPException(status_code=500, detail="Case was created but could not be reloaded.")
+        raise HTTPException(
+            status_code=500, detail="Case was created but could not be reloaded."
+        )
     return build_case_response(case_record)
 
 
@@ -959,6 +1195,60 @@ def submit_review(
     final_sar["reviewed_at"] = review_timestamp
 
     update_case(case_id, status=review_status, analyst_review=analyst_review, final_sar=final_sar)
+
+    if request.decision == "APPROVE":
+        _alert_payload = case_record.get("alert_payload") or {}
+        _evidence_pack = case_record.get("evidence_pack") or {}
+        _rule_summary = _evidence_pack.get("rule_summary") or []
+        _txn = _alert_payload.get("transactions") or {}
+
+        _narrative = updated_narrative or ""
+        _narrative_summary = _narrative[:300] + "..." if len(_narrative) > 300 else _narrative
+
+        record_customer_sar_approval(
+            customer_id=str(_alert_payload.get("customer_id") or ""),
+            case_id=case_id,
+            alert_id=str(_alert_payload.get("alert_id") or ""),
+            alert_type=str(_alert_payload.get("alert_type") or ""),
+            risk_level=str(case_record.get("risk_level") or ""),
+            risk_score=float(case_record.get("risk_score") or 0),
+            total_amount=float(_txn.get("total_amount") or 0),
+            destination_country=str(_txn.get("destination_country") or ""),
+            approved_by=request.analyst_id,
+            rules_triggered=[r["rule_id"] for r in _rule_summary if "rule_id" in r],
+            narrative_summary=_narrative_summary,
+        )
+
+        append_audit_event(case_id, "SAR_HISTORY_RECORDED", {
+            "customer_id": _alert_payload.get("customer_id"),
+            "recorded_at": utc_now(),
+        })
+
+    # Record analyst disposition for the historical feedback loop.
+    # This is what Signal 6 in the false alert filter learns from.
+    # Every approve/reject decision improves future false alert scoring
+    # for the same rule combination and customer profile.
+    rule_summary = (case_record.get("evidence_pack") or {}).get("rule_summary", [])
+    rule_ids_from_case = sorted([r["rule_id"] for r in rule_summary if "rule_id" in r])
+    customer_profile_from_case = (
+        (case_record.get("alert_payload") or {}).get("customer_profile", "")
+    )
+    disposition_value = "TRUE_POSITIVE" if request.decision == "APPROVE" else "FALSE_POSITIVE"
+
+    record_alert_disposition(
+        case_id=case_id,
+        rule_ids=rule_ids_from_case,
+        customer_profile=customer_profile_from_case,
+        disposition=disposition_value,
+        disposed_by=request.analyst_id or "unknown_analyst",
+    )
+    append_audit_event(case_id, "DISPOSITION_RECORDED", {
+        "disposition": disposition_value,
+        "rule_ids": rule_ids_from_case,
+        "customer_profile": customer_profile_from_case,
+        "disposed_by": request.analyst_id,
+    })
+
     append_audit_event(case_id, "ANALYST_REVIEW_SUBMITTED", analyst_review)
 
     if request.decision == "APPROVE":
@@ -1005,3 +1295,471 @@ def export_case_pdf(
         media_type="application/pdf",
         headers={"Content-Disposition": f"attachment; filename=SAR_{case_id}.pdf"},
     )
+
+
+@app.post("/cases/{case_id}/escalate")
+def escalate_triage_case(
+    case_id: str,
+    current_user: dict = Depends(get_current_user),
+) -> dict[str, Any]:
+    """
+    Escalates a PENDING_TRIAGE case to full pipeline processing.
+    Called by analyst from the triage queue when they decide the
+    borderline alert warrants full SAR generation.
+    Runs the complete enrich -> LLM -> narrative pipeline.
+    """
+    case_record = get_case(case_id)
+    if case_record is None:
+        raise HTTPException(status_code=404, detail="Case not found.")
+    if case_record.get("status") != "PENDING_TRIAGE":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Case status is '{case_record.get('status')}'. Only PENDING_TRIAGE cases can be escalated.",
+        )
+
+    alert_payload = dict(case_record.get("alert_payload") or {})
+
+    append_audit_event(case_id, "TRIAGE_ESCALATED", {
+        "escalated_by": current_user["username"],
+        "escalated_at": utc_now(),
+        "reason": "Analyst manually escalated borderline alert to full pipeline",
+    })
+
+    # Run enrichment
+    enrichment_result = enrich_case(alert_payload)
+    if enrichment_result.get("enriched"):
+        safe_stats = enrichment_result["safe_stats"]
+        alert_payload["customer_financials"] = {
+            "declared_monthly_income": safe_stats.get("declared_monthly_income"),
+            "avg_monthly_deposits_12m": safe_stats.get("avg_monthly_deposits_12m"),
+            "historical_baseline_txn_count": safe_stats.get("historical_baseline_txn_count"),
+            "deviation_from_baseline_pct": safe_stats.get("deviation_from_baseline_pct"),
+        }
+        alert_payload["_enrichment_context"] = {
+            "unique_counterparties_count": safe_stats.get("unique_counterparties_count"),
+            "new_counterparties_count": safe_stats.get("new_counterparties_count"),
+            "has_prior_relationship": safe_stats.get("has_prior_relationship"),
+            "alert_date_range_start": safe_stats.get("alert_date_range_start"),
+            "alert_date_range_end": safe_stats.get("alert_date_range_end"),
+        }
+        alert_payload["_customer_background"] = enrichment_result.get(
+            "customer_background", {}
+        )
+        txn_rows = enrichment_result["pii_sealed"].get("txn_table_rows", [])
+        alert_payload["transactions"]["transaction_count"] = len(txn_rows)
+        alert_payload["transactions"]["total_amount"] = round(
+            sum(float(r["amount"]) for r in txn_rows if r.get("txn_type") == "credit"), 2
+        )
+        update_case(case_id, alert_payload=alert_payload)
+
+    # Run full pipeline
+    try:
+        alert_payload["_registry_config"] = get_registry()
+        result = service.process_alert(alert_payload)
+    except Exception as exc:
+        update_case(case_id, status="FAILED")
+        append_audit_event(case_id, "CASE_FAILED", {
+            "error": str(exc), "failed_at": utc_now()
+        })
+        raise HTTPException(status_code=500, detail=f"Pipeline failed: {exc}") from exc
+
+    update_case(
+        case_id,
+        status=result["status"],
+        risk_score=result["risk_score"],
+        risk_level=result["risk_level"],
+        masked_alert_payload=result["masked_alert"],
+        evidence_pack=result["evidence_pack"],
+        retrieval_payload=result["retrieval_payload"],
+        prompt_payload=result["prompt_payload"],
+        validation_payload=result["validation_payload"],
+        final_sar=result["final_sar"],
+        enrichment_payload=enrichment_result,
+    )
+    for event in result["audit_events"]:
+        append_audit_event(case_id, event["event_type"], serialise(event["payload"]))
+
+    refreshed = get_case(case_id)
+    if refreshed is None:
+        raise HTTPException(status_code=500, detail="Case could not be reloaded after escalation.")
+    return build_case_response(refreshed)
+
+
+@app.post("/cases/{case_id}/close-false-positive")
+def close_as_false_positive(
+    case_id: str,
+    current_user: dict = Depends(get_current_user),
+) -> dict[str, Any]:
+    """
+    Closes a PENDING_TRIAGE case as a confirmed false positive.
+    Records the disposition for the historical feedback loop.
+    Called by analyst from the triage queue when they decide
+    the borderline alert is not worth escalating.
+    """
+    case_record = get_case(case_id)
+    if case_record is None:
+        raise HTTPException(status_code=404, detail="Case not found.")
+    if case_record.get("status") not in ("PENDING_TRIAGE", "AUTO_CLOSED_FALSE_POSITIVE"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Case status is '{case_record.get('status')}'. Cannot close as false positive.",
+        )
+
+    rule_summary = (case_record.get("evidence_pack") or {}).get("rule_summary", [])
+    rule_ids = sorted([r["rule_id"] for r in rule_summary if "rule_id" in r])
+    customer_profile = (case_record.get("alert_payload") or {}).get("customer_profile", "")
+
+    record_alert_disposition(
+        case_id=case_id,
+        rule_ids=rule_ids,
+        customer_profile=customer_profile,
+        disposition="FALSE_POSITIVE",
+        disposed_by=current_user["username"],
+    )
+    update_case(case_id, status="CONFIRMED_FALSE_POSITIVE")
+    append_audit_event(case_id, "CONFIRMED_FALSE_POSITIVE", {
+        "confirmed_by": current_user["username"],
+        "confirmed_at": utc_now(),
+        "rule_ids": rule_ids,
+        "customer_profile": customer_profile,
+    })
+
+    return {
+        "status": "CONFIRMED_FALSE_POSITIVE",
+        "case_id": case_id,
+        "message": (
+            "Case closed as confirmed false positive. "
+            "Disposition recorded for feedback loop. "
+            "Future alerts with this rule combination and profile "
+            "will score lower and be more likely to auto-close."
+        ),
+    }
+
+
+# ════════════════════════════════════════════════════════
+# REGULATION AUTHORING ENDPOINTS
+# ════════════════════════════════════════════════════════
+
+@app.post("/regulations/upload")
+def upload_regulation(
+    request: RegulationUploadRequest,
+    current_user: dict = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Stage a regulation by extracting threshold changes and gap report."""
+    if current_user["role"] not in ("manager", "admin"):
+        raise HTTPException(
+            status_code=403,
+            detail="Only managers and admins can upload regulations.",
+        )
+
+    file_bytes = None
+    if request.file_bytes_b64:
+        import base64 as _b64
+
+        try:
+            file_bytes = _b64.b64decode(request.file_bytes_b64)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Could not decode file_bytes_b64: {exc}",
+            )
+
+    result = process_regulation_document(
+        document_text=request.document_text or "",
+        source_filename=request.source_filename,
+        file_bytes=file_bytes,
+    )
+
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=422,
+            detail=result.get("error", "Regulation processing failed."),
+        )
+
+    doc_text = request.document_text or ""
+    if not doc_text and file_bytes:
+        from .regulation_engine import extract_text_from_bytes
+
+        try:
+            doc_text = extract_text_from_bytes(file_bytes, request.source_filename)
+        except Exception:
+            doc_text = ""
+
+    if doc_text:
+        ingest_regulation_document(
+            document_text=doc_text,
+            asset_type=request.asset_type,
+            source_filename=request.source_filename,
+            regulation_name=request.source_filename,
+        )
+
+    if not result.get("ready_for_staging"):
+        return {
+            "status": "NO_ACTIONABLE_CHANGES",
+            "message": (
+                "The document was ingested into the knowledge base but no "
+                "threshold parameters were detected that differ from current "
+                "rules.yaml values. No staging entry created."
+            ),
+            "total_chunks": result.get("total_chunks", 0),
+            "compliance_chunks": result.get("compliance_chunks", 0),
+            "extracted_params": result.get("extracted_params", {}),
+            "rule_types": result.get("rule_types_detected", []),
+        }
+
+    staging_id = str(uuid4())
+    create_staging_entry(
+        staging_id=staging_id,
+        asset_type=request.asset_type,
+        source_file=request.source_filename,
+        proposed_rules=[],
+        dry_run_result={},
+        citation_checks={},
+        regulation_list=[request.source_filename],
+        conclusion_regulation="",
+        additional_prompt_context="",
+        document_text=doc_text,
+        threshold_changes=result.get("threshold_changes", []),
+        gap_report=result.get("gap_report"),
+        rule_types_detected=result.get("rule_types_detected", []),
+        extracted_params=result.get("extracted_params", {}),
+    )
+
+    actual_changes = [c for c in result.get("threshold_changes", []) if c.get("is_change")]
+
+    return {
+        "status": "STAGED_FOR_REVIEW",
+        "staging_id": staging_id,
+        "asset_type": request.asset_type,
+        "source_file": request.source_filename,
+        "total_chunks": result.get("total_chunks", 0),
+        "compliance_chunks": result.get("compliance_chunks", 0),
+        "extracted_params": result.get("extracted_params", {}),
+        "threshold_changes": result.get("threshold_changes", []),
+        "actual_changes_count": len(actual_changes),
+        "rule_types_detected": result.get("rule_types_detected", []),
+        "gap_report": result.get("gap_report"),
+        "message": (
+            f"{len(actual_changes)} threshold parameter(s) staged for review. "
+            f"Use POST /regulations/staging/{staging_id}/review to approve or reject."
+            + (
+                " Gap report generated - new rule requirements detected that need manual implementation."
+                if result.get("gap_report")
+                else ""
+            )
+        ),
+    }
+
+
+@app.get("/regulations/staging")
+def list_staged_regulations(
+    status: str | None = None,
+    _: dict[str, str] = Depends(get_current_user),
+) -> list[dict[str, Any]]:
+    return serialise(list_staging_entries(status))
+
+
+@app.get("/regulations/staging/{staging_id}")
+def get_staged_regulation(
+    staging_id: str,
+    _: dict[str, str] = Depends(get_current_user),
+) -> dict[str, Any]:
+    entry = get_staging_entry(staging_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Staging entry not found.")
+    return serialise(entry)
+
+
+@app.post("/regulations/staging/{staging_id}/review")
+def review_staged_regulation(
+    staging_id: str,
+    request: StagingReviewRequest,
+    current_user: dict = Depends(get_current_user),
+) -> dict[str, Any]:
+    if current_user["role"] not in ("manager", "admin"):
+        raise HTTPException(
+            status_code=403,
+            detail="Only managers and admins can approve regulations.",
+        )
+
+    entry = get_staging_entry(staging_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Staging entry not found.")
+
+    if entry["status"] != "PROPOSED":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Staging entry is already '{entry['status']}'. Cannot review again.",
+        )
+
+    if request.decision == "REJECT":
+        update_staging_status(
+            staging_id=staging_id,
+            status="REJECTED",
+            reviewed_by=current_user["username"],
+            rejection_reason=request.rejection_reason,
+        )
+        return {
+            "status": "REJECTED",
+            "staging_id": staging_id,
+            "reviewed_by": current_user["username"],
+            "message": "Regulation rejected. No changes applied to rules.yaml.",
+        }
+
+    asset_type = entry["asset_type"]
+
+    raw_changes = entry.get("threshold_changes") or []
+    if isinstance(raw_changes, str):
+        raw_changes = json.loads(raw_changes)
+
+    if request.approved_changes:
+        raw_changes = [c for c in raw_changes if c.get("key") in request.approved_changes]
+
+    apply_result = apply_threshold_updates(raw_changes)
+
+    try:
+        from rag_pipeline.rule_engine import load_rule_config as _rc1
+
+        _rc1.cache_clear()
+    except Exception:
+        pass
+    try:
+        load_rule_config.cache_clear()
+    except Exception:
+        pass
+
+    # Pull regulation data from staging entry
+    raw_reg_list = entry.get("regulation_list")
+    if isinstance(raw_reg_list, str):
+        import json as _json
+        regulation_list = _json.loads(raw_reg_list) or [entry["source_file"]]
+    elif raw_reg_list:
+        regulation_list = raw_reg_list
+    else:
+        regulation_list = [entry["source_file"]]
+    conclusion_regulation = entry.get("conclusion_regulation") or ""
+    additional_prompt_context = entry.get("additional_prompt_context") or ""
+
+    activate_asset_type_in_registry(
+        asset_type=asset_type,
+        regulations=regulation_list,
+        conclusion_regulation=conclusion_regulation,
+        additional_prompt_context=additional_prompt_context,
+        activated_by=current_user["username"],
+    )
+
+    update_staging_status(
+        staging_id=staging_id,
+        status="PROMOTED",
+        reviewed_by=current_user["username"],
+    )
+
+    # Release and reprocess all quarantined alerts
+    released = release_quarantined_alerts(asset_type)
+    reprocessed: list[dict[str, Any]] = []
+
+    for row in released:
+        quarantine_id = row["quarantine_id"]
+        try:
+            alert_payload = (
+                dict(row["alert_payload"])
+                if isinstance(row["alert_payload"], dict)
+                else json.loads(row["alert_payload"])
+            )
+            # Reprocess via full pipeline
+            new_case_id = str(uuid4())
+            new_masked = mask_alert(alert_payload)
+            create_case(new_case_id, alert_payload, new_masked)
+
+            enrichment_result = enrich_case(alert_payload)
+            if enrichment_result.get("enriched"):
+                safe_stats = enrichment_result["safe_stats"]
+                alert_payload["customer_financials"] = {
+                    "declared_monthly_income":       safe_stats.get("declared_monthly_income"),
+                    "avg_monthly_deposits_12m":      safe_stats.get("avg_monthly_deposits_12m"),
+                    "historical_baseline_txn_count": safe_stats.get("historical_baseline_txn_count"),
+                    "deviation_from_baseline_pct":   safe_stats.get("deviation_from_baseline_pct"),
+                }
+                alert_payload["_enrichment_context"] = {
+                    "unique_counterparties_count": safe_stats.get("unique_counterparties_count"),
+                    "new_counterparties_count":    safe_stats.get("new_counterparties_count"),
+                    "has_prior_relationship":      safe_stats.get("has_prior_relationship"),
+                    "alert_date_range_start":      safe_stats.get("alert_date_range_start"),
+                    "alert_date_range_end":        safe_stats.get("alert_date_range_end"),
+                }
+                txn_rows = enrichment_result["pii_sealed"].get("txn_table_rows", [])
+                alert_payload["transactions"]["transaction_count"] = len(txn_rows)
+                alert_payload["transactions"]["total_amount"] = round(
+                    sum(float(r["amount"]) for r in txn_rows if r.get("txn_type") == "credit"), 2
+                )
+
+            result = service.process_alert(alert_payload)
+            update_case(
+                new_case_id,
+                alert_id=alert_payload["alert_id"],
+                status=result["status"],
+                risk_score=result["risk_score"],
+                risk_level=result["risk_level"],
+                masked_alert_payload=result["masked_alert"],
+                evidence_pack=result["evidence_pack"],
+                retrieval_payload=result["retrieval_payload"],
+                prompt_payload=result["prompt_payload"],
+                validation_payload=result["validation_payload"],
+                final_sar=result["final_sar"],
+                enrichment_payload=enrichment_result,
+            )
+            for event in result["audit_events"]:
+                append_audit_event(new_case_id, event["event_type"], serialise(event["payload"]))
+
+            reprocessed.append({
+                "quarantine_id": quarantine_id,
+                "alert_id": alert_payload.get("alert_id"),
+                "new_case_id": new_case_id,
+                "status": "REPROCESSED",
+                "risk_level": result["risk_level"],
+            })
+        except Exception as exc:
+            reprocessed.append({
+                "quarantine_id": quarantine_id,
+                "alert_id": alert_payload.get("alert_id", "UNKNOWN"),
+                "status": "REPROCESS_FAILED",
+                "error": str(exc),
+            })
+
+    return {
+        "status": "APPROVED_AND_PROMOTED",
+        "staging_id": staging_id,
+        "asset_type": asset_type,
+        "reviewed_by": current_user["username"],
+        "threshold_updates_applied": apply_result.get("applied", []),
+        "threshold_updates_skipped": apply_result.get("skipped", []),
+        "total_applied": apply_result.get("total_applied", 0),
+        "quarantined_alerts_released": len(released),
+        "reprocessed": reprocessed,
+        "gap_report": entry.get("gap_report"),
+        "message": (
+            f"Regulatory framework for {asset_type} is now ACTIVE. "
+            f"{apply_result.get('total_applied', 0)} threshold value(s) updated in rules.yaml. "
+            f"Rule engine cache cleared. "
+            f"{len(released)} quarantined alerts reprocessed."
+            + (
+                " Gap report present - new rule requirements still need manual implementation."
+                if entry.get("gap_report")
+                else ""
+            )
+        ),
+    }
+
+
+@app.get("/regulations/registry")
+def get_regulation_registry(
+    _: dict[str, str] = Depends(get_current_user),
+) -> dict[str, Any]:
+    return get_registry()
+
+
+@app.get("/regulations/quarantine")
+def get_quarantine_queue(
+    _: dict[str, str] = Depends(get_current_user),
+) -> list[dict[str, Any]]:
+    return serialise(list_quarantine_queue())

@@ -43,6 +43,13 @@ SEED_CUSTOMERS = [
         "occupation":     "Student",
         "monthly_income": 15000.00,   # Student stipend
         "risk_rating":    "HIGH",
+        "relationship_since": "2022-06-15",
+        "relationship_type": "STANDARD",
+        "pep_flag": False,
+        "adverse_media_flag": False,
+        "nationality": "Indian",
+        "kyc_last_reviewed": "2025-06-15",
+        "kyc_review_due": "2026-06-15",
     },
     {
         "customer_id":    "CUST_1002",
@@ -50,6 +57,13 @@ SEED_CUSTOMERS = [
         "occupation":     "Salaried employee",
         "monthly_income": 85000.00,
         "risk_rating":    "LOW",
+        "relationship_since": "2019-01-10",
+        "relationship_type": "STANDARD",
+        "pep_flag": False,
+        "adverse_media_flag": False,
+        "nationality": "Indian",
+        "kyc_last_reviewed": "2025-05-10",
+        "kyc_review_due": "2026-05-10",
     },
     {
         "customer_id":    "CUST_1003",
@@ -57,6 +71,13 @@ SEED_CUSTOMERS = [
         "occupation":     "Retail business owner",
         "monthly_income": 150000.00,
         "risk_rating":    "MEDIUM",
+        "relationship_since": "2018-03-20",
+        "relationship_type": "PREMIUM",
+        "pep_flag": False,
+        "adverse_media_flag": False,
+        "nationality": "Indian",
+        "kyc_last_reviewed": "2025-04-01",
+        "kyc_review_due": "2026-04-01",
     },
     {
         "customer_id":    "CUST_1004",
@@ -64,6 +85,13 @@ SEED_CUSTOMERS = [
         "occupation":     "Retired",
         "monthly_income": 25000.00,
         "risk_rating":    "LOW",
+        "relationship_since": "2015-11-10",
+        "relationship_type": "STANDARD",
+        "pep_flag": False,
+        "adverse_media_flag": False,
+        "nationality": "Indian",
+        "kyc_last_reviewed": "2025-03-20",
+        "kyc_review_due": "2026-03-20",
     },
 ]
 
@@ -311,17 +339,34 @@ def seed() -> None:
     execute_values(
         cursor,
         """
-        INSERT INTO customers (customer_id, name, occupation, monthly_income, risk_rating)
+        INSERT INTO customers (
+            customer_id, name, occupation, monthly_income, risk_rating,
+            relationship_since, relationship_type,
+            pep_flag, adverse_media_flag, nationality,
+            kyc_last_reviewed, kyc_review_due
+        )
         VALUES %s
         ON CONFLICT (customer_id) DO UPDATE SET
             name           = EXCLUDED.name,
             occupation     = EXCLUDED.occupation,
             monthly_income = EXCLUDED.monthly_income,
-            risk_rating    = EXCLUDED.risk_rating
+            risk_rating    = EXCLUDED.risk_rating,
+            relationship_since  = EXCLUDED.relationship_since,
+            relationship_type   = EXCLUDED.relationship_type,
+            pep_flag            = EXCLUDED.pep_flag,
+            adverse_media_flag  = EXCLUDED.adverse_media_flag,
+            nationality         = EXCLUDED.nationality,
+            kyc_last_reviewed   = EXCLUDED.kyc_last_reviewed,
+            kyc_review_due      = EXCLUDED.kyc_review_due
         """,
         [
-            (c["customer_id"], c["name"], c["occupation"],
-             c["monthly_income"], c["risk_rating"])
+            (
+                c["customer_id"], c["name"], c["occupation"],
+                c["monthly_income"], c["risk_rating"],
+                c["relationship_since"], c["relationship_type"],
+                c["pep_flag"], c["adverse_media_flag"], c["nationality"],
+                c["kyc_last_reviewed"], c["kyc_review_due"],
+            )
             for c in SEED_CUSTOMERS
         ],
     )

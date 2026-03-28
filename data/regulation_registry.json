@@ -1,0 +1,24 @@
+{
+  "FIAT_WIRE": {
+    "status": "ACTIVE",
+    "rules_loaded": true,
+    "rag_collection": "sar_knowledge",
+    "regulations": [
+      "regulation_template.md"
+    ],
+    "conclusion_regulation": "",
+    "additional_prompt_context": "",
+    "activated_at": "2026-03-28T19:04:53.481853+00:00",
+    "activated_by": "manager"
+  },
+  "CRYPTO_VDA": {
+    "status": "PENDING",
+    "rules_loaded": false,
+    "rag_collection": null,
+    "regulations": [],
+    "conclusion_regulation": "",
+    "additional_prompt_context": "",
+    "activated_at": null,
+    "activated_by": null
+  }
+}

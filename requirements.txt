@@ -12,12 +12,15 @@ ollama>=0.1.7
 
 # PDF Generation
 reportlab>=4.1.0
+pdfplumber>=0.11.0
+python-docx>=1.1.0
 
 # Utilities
 python-dotenv>=1.0.0
 pydantic>=2.6.0
 requests>=2.31.0
 PyYAML>=6.0.1
+ruamel.yaml>=0.18.0
 python-jose[cryptography]>=3.3.0
 passlib[bcrypt]>=1.7.4
 pytest>=8.2.0

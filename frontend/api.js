@@ -1,7 +1,7 @@
 const API_BASE = "http://localhost:8000";
 
 function getToken() {
-  return sessionStorage.getItem("jwt_token");
+  return sessionStorage.getItem("jwt_token") || "";
 }
 
 function getAuthHeaders(extraHeaders = {}) {
@@ -83,6 +83,27 @@ async function exportPDF(id) {
   return apiFetch(`/cases/${id}/export/pdf`, { method: "GET" });
 }
 
+async function apiRequest(path, method = "GET", body = null) {
+  const token = getToken();
+  const options = {
+    method,
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+  };
+  if (body) options.body = JSON.stringify(body);
+
+  const BASE_URL = "http://localhost:8000";
+  const response = await fetch(`${BASE_URL}${path}`, options);
+
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({ detail: response.statusText }));
+    throw new Error(err.detail || `HTTP ${response.status}`);
+  }
+  return response.json();
+}
+
 export {
   API_BASE,
   getToken,
@@ -94,4 +115,5 @@ export {
   replayCase,
   getAudit,
   exportPDF,
+  apiRequest,
 };

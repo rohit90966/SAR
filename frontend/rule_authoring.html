@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Regulation Authoring Console</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap');
+
+:root {
+  --bg: #0d1117;
+  --bg2: #161b22;
+  --bg3: #21262d;
+  --text: #e6edf3;
+  --text2: #8b949e;
+  --line: #30363d;
+  --blue: #1f6feb;
+  --green: #3fb950;
+  --red: #f85149;
+  --amber: #d29922;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: radial-gradient(circle at 20% -10%, #16233a 0%, #0d1117 35%), var(--bg);
+  color: var(--text);
+  font-family: "IBM Plex Sans", sans-serif;
+}
+
+.shell {
+  min-height: 100vh;
+  display: grid;
+  grid-template-columns: 240px 1fr;
+  grid-template-rows: 56px 1fr;
+}
+
+.topbar {
+  grid-column: 1 / -1;
+  border-bottom: 1px solid var(--line);
+  background: rgba(13,17,23,.9);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 18px;
+}
+
+.logo {
+  font-family: "IBM Plex Mono", monospace;
+  color: #58a6ff;
+  font-size: 13px;
+  letter-spacing: .05em;
+}
+
+.sidebar {
+  border-right: 1px solid var(--line);
+  background: var(--bg2);
+  padding: 14px 0;
+}
+
+.nav-item {
+  padding: 10px 16px;
+  color: var(--text2);
+  cursor: pointer;
+  border-left: 3px solid transparent;
+}
+
+.nav-item:hover { background: var(--bg3); color: var(--text); }
+.nav-item.active { border-left-color: var(--blue); background: rgba(31,111,235,.14); color: #7cb7ff; }
+
+.main { padding: 20px; overflow: auto; }
+.view { display: none; }
+.view.active { display: block; }
+
+.card {
+  background: rgba(22,27,34,.95);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 16px;
+  margin-bottom: 14px;
+}
+
+.title { font-size: 22px; margin: 0 0 4px; }
+.sub { margin: 0 0 16px; color: var(--text2); font-size: 13px; }
+
+label { display: block; font-size: 12px; color: var(--text2); margin-bottom: 5px; }
+input, select, textarea {
+  width: 100%;
+  background: var(--bg3);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+textarea { min-height: 100px; resize: vertical; }
+
+.row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+
+.btn {
+  background: var(--blue);
+  border: none;
+  color: #fff;
+  border-radius: 8px;
+  padding: 9px 14px;
+  cursor: pointer;
+}
+
+.btn.secondary { background: transparent; border: 1px solid var(--line); color: var(--text2); }
+.btn.good { background: var(--green); color: #08150b; }
+.btn.bad { background: var(--red); }
+
+.stack { display: flex; gap: 8px; flex-wrap: wrap; }
+
+.pill {
+  display: inline-block;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  font-size: 11px;
+  font-family: "IBM Plex Mono", monospace;
+}
+
+.ok { color: var(--green); border-color: rgba(63,185,80,.4); }
+.warn { color: var(--amber); border-color: rgba(210,153,34,.5); }
+
+table { width: 100%; border-collapse: collapse; font-size: 12px; }
+th, td { border-bottom: 1px solid var(--line); padding: 8px; text-align: left; }
+th { color: var(--text2); font-weight: 600; }
+
+.old { color: var(--red); text-decoration: line-through; }
+.new { color: var(--green); font-weight: 600; }
+
+.msg { margin-top: 10px; font-size: 13px; }
+.err { color: #ff9b9b; }
+.success { color: #9cf0a7; }
+
+.drop {
+  border: 2px dashed #445;
+  border-radius: 10px;
+  padding: 20px;
+  text-align: center;
+  margin-bottom: 10px;
+}
+
+@media (max-width: 980px) {
+  .shell { grid-template-columns: 1fr; grid-template-rows: 56px auto 1fr; }
+  .sidebar { border-right: 0; border-bottom: 1px solid var(--line); display: flex; overflow: auto; }
+  .nav-item { white-space: nowrap; }
+  .row { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<div class="shell">
+  <header class="topbar">
+    <div class="logo">SAR SYSTEM :: Regulation Authoring Console</div>
+    <div>
+      <button class="btn secondary" onclick="showLogin()">Login</button>
+    </div>
+  </header>
+
+  <nav class="sidebar">
+    <div class="nav-item active" data-view="upload" onclick="showView('upload', this)">Upload Regulation</div>
+    <div class="nav-item" data-view="staging" onclick="showView('staging', this)">Staging Queue</div>
+    <div class="nav-item" data-view="thresholds" onclick="showView('thresholds', this)">Current Thresholds</div>
+    <div class="nav-item" data-view="registry" onclick="showView('registry', this)">Domain Registry</div>
+    <div class="nav-item" data-view="quarantine" onclick="showView('quarantine', this)">Quarantine Queue</div>
+  </nav>
+
+  <main class="main">
+    <section id="view-upload" class="view active">
+      <h1 class="title">Upload Regulation</h1>
+      <p class="sub">Upload PDF or DOCX or paste plain text. The system stages threshold changes for review.</p>
+
+      <div class="card">
+        <div class="drop">
+          <input type="file" id="fileInput" accept=".pdf,.docx,.txt,.md" />
+        </div>
+        <div class="row">
+          <div>
+            <label>Asset Type</label>
+            <select id="assetType">
+              <option value="FIAT_WIRE">FIAT_WIRE</option>
+              <option value="CRYPTO_VDA">CRYPTO_VDA</option>
+            </select>
+          </div>
+          <div>
+            <label>Source Filename (used if plain text)</label>
+            <input id="sourceFilename" type="text" placeholder="regulation.txt" />
+          </div>
+        </div>
+        <div style="margin-top:10px;">
+          <label>Plain Text</label>
+          <textarea id="plainText" placeholder="Paste regulation text here..."></textarea>
+        </div>
+        <div class="stack" style="margin-top:10px;">
+          <button class="btn" onclick="runUpload()">Run Adaptation Pipeline</button>
+          <button class="btn secondary" onclick="clearUpload()">Clear</button>
+        </div>
+        <div id="uploadMsg" class="msg"></div>
+      </div>
+
+      <div id="uploadResult" class="card" style="display:none;"></div>
+    </section>
+
+    <section id="view-staging" class="view">
+      <h1 class="title">Staging Queue</h1>
+      <p class="sub">Approve or reject threshold changes. Approval updates only threshold values.</p>
+      <div class="card">
+        <div class="stack" style="margin-bottom:10px;">
+          <button class="btn secondary" onclick="loadStaging()">Refresh</button>
+        </div>
+        <div id="stagingList"></div>
+      </div>
+      <div class="card" id="stagingDetail" style="display:none;"></div>
+    </section>
+
+    <section id="view-thresholds" class="view">
+      <h1 class="title">Current Thresholds</h1>
+      <p class="sub">Read from rules.yaml via API when threshold endpoint exists.</p>
+      <div class="card">
+        <button class="btn secondary" onclick="loadThresholds()">Refresh</button>
+        <div id="thresholdsBox" style="margin-top:10px;"></div>
+      </div>
+    </section>
+
+    <section id="view-registry" class="view">
+      <h1 class="title">Domain Registry</h1>
+      <p class="sub">Asset type readiness and active regulatory framework state.</p>
+      <div class="card">
+        <button class="btn secondary" onclick="loadRegistry()">Refresh</button>
+        <div id="registryBox" style="margin-top:10px;"></div>
+      </div>
+    </section>
+
+    <section id="view-quarantine" class="view">
+      <h1 class="title">Quarantine Queue</h1>
+      <p class="sub">Alerts waiting for regulatory activation.</p>
+      <div class="card">
+        <button class="btn secondary" onclick="loadQuarantine()">Refresh</button>
+        <div id="quarantineBox" style="margin-top:10px;"></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script>
+const API = "http://localhost:8000";
+let token = localStorage.getItem("sar_token") || "";
+let currentStagingId = null;
+let currentStagingEntry = null;
+
+function showView(id, el) {
+  document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  document.getElementById('view-' + id).classList.add('active');
+  if (el) el.classList.add('active');
+  if (id === 'staging') loadStaging();
+  if (id === 'registry') loadRegistry();
+  if (id === 'quarantine') loadQuarantine();
+  if (id === 'thresholds') loadThresholds();
+}
+
+function showLogin() {
+  const u = prompt('Username', 'manager') || '';
+  const p = prompt('Password', 'password123') || '';
+  login(u, p);
+}
+
+async function login(username, password) {
+  try {
+    const res = await fetch(API + '/login', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({username, password})
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Login failed');
+    token = data.access_token;
+    localStorage.setItem('sar_token', token);
+    alert('Login successful');
+  } catch (e) {
+    alert('Login failed: ' + e.message);
+  }
+}
+
+function headers() {
+  return {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token};
+}
+
+function esc(s) {
+  return String(s || '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+}
+
+async function runUpload() {
+  const msg = document.getElementById('uploadMsg');
+  const resultBox = document.getElementById('uploadResult');
+  msg.className = 'msg';
+  msg.textContent = '';
+
+  if (!token) { showLogin(); return; }
+
+  const assetType = document.getElementById('assetType').value;
+  const text = document.getElementById('plainText').value.trim();
+  const file = document.getElementById('fileInput').files[0];
+  const filenameInput = document.getElementById('sourceFilename').value.trim();
+
+  if (!file && !text) {
+    msg.className = 'msg err';
+    msg.textContent = 'Upload a file or provide plain text.';
+    return;
+  }
+
+  const body = {asset_type: assetType};
+  if (file) {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    let binary = '';
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    body.file_bytes_b64 = btoa(binary);
+    body.source_filename = file.name;
+  } else {
+    body.document_text = text;
+    body.source_filename = filenameInput || ('paste_' + Date.now() + '.txt');
+  }
+
+  try {
+    const res = await fetch(API + '/regulations/upload', {method: 'POST', headers: headers(), body: JSON.stringify(body)});
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Upload failed');
+
+    const changes = data.threshold_changes || [];
+    resultBox.style.display = 'block';
+    resultBox.innerHTML = `
+      <div class="stack" style="margin-bottom:8px;">
+        <span class="pill">chunks=${data.total_chunks || 0}</span>
+        <span class="pill">compliance=${data.compliance_chunks || 0}</span>
+        <span class="pill">changes=${data.actual_changes_count || 0}</span>
+      </div>
+      <div class="stack">${(data.rule_types_detected || []).map(t => `<span class="pill ${t === 'NEW_RULE' ? 'warn' : 'ok'}">${t}</span>`).join('')}</div>
+      <div style="margin-top:10px;">
+        <table>
+          <thead><tr><th>Key</th><th>Current</th><th>New</th><th>Section</th></tr></thead>
+          <tbody>
+            ${changes.map(c => `<tr>
+              <td>${esc(c.key)}</td>
+              <td>${c.is_change ? `<span class='old'>${esc(c.old_value)}</span>` : esc(c.old_value)}</td>
+              <td>${c.is_change ? `<span class='new'>${esc(c.new_value)}</span>` : esc(c.new_value)}</td>
+              <td>${esc(c.source_section)}</td>
+            </tr>`).join('')}
+          </tbody>
+        </table>
+      </div>
+      ${data.gap_report ? `<div class='msg warn' style='margin-top:8px;'>Gap report present. Manual implementation is required for new rule logic.</div>` : ''}
+      <div class='msg success'>${esc(data.message || '')}</div>
+    `;
+    msg.className = 'msg success';
+    msg.textContent = data.status;
+  } catch (e) {
+    msg.className = 'msg err';
+    msg.textContent = e.message;
+    resultBox.style.display = 'none';
+  }
+}
+
+function clearUpload() {
+  document.getElementById('fileInput').value = '';
+  document.getElementById('plainText').value = '';
+  document.getElementById('sourceFilename').value = '';
+  document.getElementById('uploadMsg').textContent = '';
+  document.getElementById('uploadResult').style.display = 'none';
+}
+
+async function loadStaging() {
+  const box = document.getElementById('stagingList');
+  if (!token) { box.textContent = 'Login required.'; return; }
+  box.textContent = 'Loading...';
+  try {
+    const res = await fetch(API + '/regulations/staging', {headers: headers()});
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Failed to load staging');
+    if (!Array.isArray(data) || !data.length) { box.textContent = 'No staging entries.'; return; }
+
+    box.innerHTML = data.map(e => `<div class='card' style='padding:10px;margin:0 0 8px;'>
+      <div><strong>${esc(e.source_file)}</strong> <span class='pill'>${esc(e.asset_type)}</span> <span class='pill'>${esc(e.status)}</span></div>
+      <div style='color:var(--text2);font-size:12px;margin-top:4px;'>${esc(e.proposed_at || '')}</div>
+      <div style='margin-top:6px;'><button class='btn secondary' onclick="openStaging('${esc(e.staging_id)}')">Open</button></div>
+    </div>`).join('');
+  } catch (e) {
+    box.textContent = e.message;
+  }
+}
+
+async function openStaging(stagingId) {
+  currentStagingId = stagingId;
+  const detail = document.getElementById('stagingDetail');
+  detail.style.display = 'block';
+  detail.innerHTML = 'Loading...';
+  try {
+    const res = await fetch(API + '/regulations/staging/' + stagingId, {headers: headers()});
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Failed to open staging');
+    currentStagingEntry = data;
+    const changes = Array.isArray(data.threshold_changes) ? data.threshold_changes : (data.threshold_changes ? JSON.parse(data.threshold_changes) : []);
+    detail.innerHTML = `
+      <h3 style='margin-top:0;'>${esc(data.source_file)}</h3>
+      <div class='stack'>
+        <span class='pill'>${esc(data.asset_type)}</span>
+        <span class='pill'>${esc(data.status)}</span>
+      </div>
+      <table style='margin-top:8px;'>
+        <thead><tr><th>Approve</th><th>Key</th><th>Current</th><th>New</th><th>Section</th></tr></thead>
+        <tbody>
+          ${changes.map(c => `<tr>
+            <td>${c.is_change ? `<input type='checkbox' class='change-box' checked data-key='${esc(c.key)}'/>` : ''}</td>
+            <td>${esc(c.key)}</td>
+            <td>${c.is_change ? `<span class='old'>${esc(c.old_value)}</span>` : esc(c.old_value)}</td>
+            <td>${c.is_change ? `<span class='new'>${esc(c.new_value)}</span>` : esc(c.new_value)}</td>
+            <td>${esc(c.source_section)}</td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+      ${data.status === 'PROPOSED' ? `<div class='stack' style='margin-top:10px;'>
+        <button class='btn good' onclick="submitReview('APPROVE')">Approve</button>
+        <button class='btn bad' onclick="submitReview('REJECT')">Reject</button>
+      </div>` : ''}
+      <div id='reviewMsg' class='msg'></div>
+    `;
+  } catch (e) {
+    detail.textContent = e.message;
+  }
+}
+
+async function submitReview(decision) {
+  const msg = document.getElementById('reviewMsg');
+  msg.className = 'msg';
+  msg.textContent = '';
+  try {
+    const body = {decision};
+    if (decision === 'REJECT') {
+      const reason = prompt('Rejection reason');
+      if (!reason) return;
+      body.rejection_reason = reason;
+    }
+    if (decision === 'APPROVE') {
+      const selected = Array.from(document.querySelectorAll('.change-box:checked')).map(n => n.getAttribute('data-key'));
+      if (selected.length) body.approved_changes = selected;
+    }
+
+    const res = await fetch(API + '/regulations/staging/' + currentStagingId + '/review', {
+      method: 'POST',
+      headers: headers(),
+      body: JSON.stringify(body)
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Review failed');
+    msg.className = 'msg success';
+    msg.textContent = data.message || data.status;
+    loadStaging();
+  } catch (e) {
+    msg.className = 'msg err';
+    msg.textContent = e.message;
+  }
+}
+
+async function loadThresholds() {
+  const box = document.getElementById('thresholdsBox');
+  box.innerHTML = `
+    <div class='stack'>
+      <span class='pill'>reporting_threshold</span>
+      <span class='pill'>structuring_txn_count</span>
+      <span class='pill'>velocity_per_day</span>
+      <span class='pill'>large_amount</span>
+      <span class='pill'>rapid_movement_days</span>
+    </div>
+    <div class='msg'>Threshold endpoint can be added as GET /regulations/thresholds for live values.</div>
+  `;
+}
+
+async function loadRegistry() {
+  const box = document.getElementById('registryBox');
+  if (!token) { box.textContent = 'Login required.'; return; }
+  box.textContent = 'Loading...';
+  try {
+    const res = await fetch(API + '/regulations/registry', {headers: headers()});
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Failed to load registry');
+    const entries = Object.entries(data || {});
+    if (!entries.length) { box.textContent = 'Registry empty.'; return; }
+    box.innerHTML = entries.map(([asset, info]) => `
+      <div class='card' style='padding:10px;margin:0 0 8px;'>
+        <div><strong>${esc(asset)}</strong> <span class='pill'>${esc(info.status || 'UNKNOWN')}</span></div>
+        <div style='font-size:12px;color:var(--text2);margin-top:4px;'>collection=${esc(info.rag_collection || '-')}</div>
+      </div>
+    `).join('');
+  } catch (e) {
+    box.textContent = e.message;
+  }
+}
+
+async function loadQuarantine() {
+  const box = document.getElementById('quarantineBox');
+  if (!token) { box.textContent = 'Login required.'; return; }
+  box.textContent = 'Loading...';
+  try {
+    const res = await fetch(API + '/regulations/quarantine', {headers: headers()});
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Failed to load quarantine');
+    if (!Array.isArray(data) || !data.length) { box.textContent = 'No quarantined alerts.'; return; }
+    box.innerHTML = `
+      <table>
+        <thead><tr><th>Alert</th><th>Type</th><th>Asset</th><th>Status</th><th>Created</th></tr></thead>
+        <tbody>${data.map(q => `<tr>
+          <td>${esc(q.alert_id || '-')}</td>
+          <td>${esc(q.alert_type || '-')}</td>
+          <td>${esc(q.asset_type || '-')}</td>
+          <td>${esc(q.status || '-')}</td>
+          <td>${esc(q.created_at || '-')}</td>
+        </tr>`).join('')}</tbody>
+      </table>
+    `;
+  } catch (e) {
+    box.textContent = e.message;
+  }
+}
+</script>
+</body>
+</html>

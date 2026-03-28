@@ -4,11 +4,11 @@ defaults:
   expected_profile_max: 1000000
 
 thresholds:
-  structuring_txn_count: 20
-  velocity_per_day: 5
+  structuring_txn_count: 30
+  velocity_per_day: 10
   reporting_threshold: 1000000
-  large_amount: 1000000
-  rapid_movement_days: 3
+  large_amount: 1800000
+  rapid_movement_days: 1
 
 profile_max_amounts:
   Retail business owner: 2000000
@@ -17,217 +17,234 @@ profile_max_amounts:
   Retired: 300000
 
 high_risk_countries:
-  - UAE
-  - CAYMAN
-  - PANAMA
-  - BAHAMAS
-  - SEYCHELLES
-  - MAURITIUS
-  - VANUATU
-  - MYANMAR
-  - IRAN
-  - NORTH KOREA
-
+- BAHAMAS
+- CAYMAN
+- IRAN
+- MAURITIUS
+- MYANMAR
+- NORTH KOREA
+- PANAMA
+- SEYCHELLES
+- SYRIA
+- UAE
+- VANUATU
 rules:
-  - id: AML-001
-    name: Structuring / Smurfing
-    conditions:
-      - type: gt
-        path: txn.transaction_count
-        value_ref: thresholds.structuring_txn_count
-    confidence:
-      mode: scaled_cap
-      numerator_path: txn.transaction_count
-      denominator_ref: thresholds.structuring_txn_count
-      multiplier: 0.5
-      cap: 0.95
-    observation_template: "{txn.transaction_count} transactions in {txn.time_window_days} days"
-    audit_reason:
-      why_flagged_template: "Transaction count {txn.transaction_count} exceeds FIU-IND threshold of {thresholds.structuring_txn_count}"
-      regulation: FIU-IND Guideline Section 3.2
-      threshold_ref: thresholds.structuring_txn_count
-      actual_value_ref: txn.transaction_count
+- id: AML-001
+  name: Structuring / Smurfing
+  conditions:
+  - type: gt
+    path: txn.transaction_count
+    value_ref: thresholds.structuring_txn_count
+  confidence:
+    mode: scaled_cap
+    numerator_path: txn.transaction_count
+    denominator_ref: thresholds.structuring_txn_count
+    multiplier: 0.5
+    cap: 0.95
+  observation_template: "{txn.transaction_count} transactions in {txn.time_window_days}
+    days"
+  audit_reason:
+    why_flagged_template: "Transaction count {txn.transaction_count} exceeds FIU-IND
+      threshold of {thresholds.structuring_txn_count}"
+    regulation: FIU-IND Guideline Section 3.2
+    threshold_ref: thresholds.structuring_txn_count
+    actual_value_ref: txn.transaction_count
 
-  - id: AML-002
-    name: High Velocity Transactions
-    conditions:
-      - type: gt
-        path: derived.txn_per_day
-        value_ref: thresholds.velocity_per_day
-    confidence:
-      mode: scaled_cap
-      numerator_path: derived.txn_per_day
-      denominator_ref: thresholds.velocity_per_day
-      multiplier: 0.6
-      cap: 0.95
-    observation_template: "{derived.txn_per_day} transactions per day average over {txn.time_window_days} days"
-    audit_reason:
-      why_flagged_template: "Velocity {derived.txn_per_day} txn/day exceeds RBI threshold of {thresholds.velocity_per_day} txn/day"
-      regulation: RBI AML Guidelines - Velocity Check
-      threshold_ref: thresholds.velocity_per_day
-      actual_value_ref: derived.txn_per_day
+- id: AML-002
+  name: High Velocity Transactions
+  conditions:
+  - type: gt
+    path: derived.txn_per_day
+    value_ref: thresholds.velocity_per_day
+  confidence:
+    mode: scaled_cap
+    numerator_path: derived.txn_per_day
+    denominator_ref: thresholds.velocity_per_day
+    multiplier: 0.6
+    cap: 0.95
+  observation_template: "{derived.txn_per_day} transactions per day average over {txn.time_window_days}
+    days"
+  audit_reason:
+    why_flagged_template: "Velocity {derived.txn_per_day} txn/day exceeds RBI threshold
+      of {thresholds.velocity_per_day} txn/day"
+    regulation: RBI AML Guidelines - Velocity Check
+    threshold_ref: thresholds.velocity_per_day
+    actual_value_ref: derived.txn_per_day
 
-  - id: AML-003
-    name: Below Threshold Structuring
-    conditions:
-      - type: between_exclusive
-        path: derived.avg_amount
-        lower_ref: derived.lower_band
-        upper_ref: derived.upper_band
-    confidence: 0.88
-    observation_template: "Average transaction INR {derived.avg_amount} is just below RBI reporting limit INR {thresholds.reporting_threshold}"
-    audit_reason:
-      why_flagged_template: "Avg amount INR {derived.avg_amount} falls in 70-99% band of RBI reporting threshold - classic structuring indicator"
-      regulation: PMLA 2002 - Structuring Definition
-      threshold_ref: thresholds.reporting_threshold
-      actual_value_ref: derived.avg_amount
+- id: AML-003
+  name: Below Threshold Structuring
+  conditions:
+  - type: between_exclusive
+    path: derived.avg_amount
+    lower_ref: derived.lower_band
+    upper_ref: derived.upper_band
+  confidence: 0.88
+  observation_template: "Average transaction INR {derived.avg_amount} is just below
+    RBI reporting limit INR {thresholds.reporting_threshold}"
+  audit_reason:
+    why_flagged_template: "Avg amount INR {derived.avg_amount} falls in 70-99% band
+      of RBI reporting threshold - classic structuring indicator"
+    regulation: PMLA 2002 - Structuring Definition
+    threshold_ref: thresholds.reporting_threshold
+    actual_value_ref: derived.avg_amount
 
-  - id: AML-004
-    name: Large Value Transaction
-    conditions:
-      - type: gt
-        path: txn.total_amount
-        value_ref: thresholds.large_amount
-    confidence:
-      mode: scaled_cap
-      numerator_path: txn.total_amount
-      denominator_ref: thresholds.large_amount
-      multiplier: 0.16
-      cap: 0.95
-    observation_template: "Total INR {txn.total_amount} transferred within {txn.time_window_days} days"
-    audit_reason:
-      why_flagged_template: "Total amount INR {txn.total_amount} exceeds RBI CTR threshold INR {thresholds.large_amount}"
-      regulation: RBI Master Direction 2023 - CTR Filing
-      threshold_ref: thresholds.large_amount
-      actual_value_ref: txn.total_amount
+- id: AML-004
+  name: Large Value Transaction
+  conditions:
+  - type: gt
+    path: txn.total_amount
+    value_ref: thresholds.large_amount
+  confidence:
+    mode: scaled_cap
+    numerator_path: txn.total_amount
+    denominator_ref: thresholds.large_amount
+    multiplier: 0.16
+    cap: 0.95
+  observation_template: "Total INR {txn.total_amount} transferred within {txn.time_window_days}
+    days"
+  audit_reason:
+    why_flagged_template: "Total amount INR {txn.total_amount} exceeds RBI CTR threshold
+      INR {thresholds.large_amount}"
+    regulation: RBI Master Direction 2023 - CTR Filing
+    threshold_ref: thresholds.large_amount
+    actual_value_ref: txn.total_amount
 
-  - id: AML-005
-    name: Profile Inconsistency
-    conditions:
-      - type: gt
-        path: txn.total_amount
-        value_ref: derived.expected_max
-    confidence: 0.82
-    observation_template: "INR {txn.total_amount} is inconsistent with '{customer.customer_profile}' profile (expected max INR {derived.expected_max})"
-    audit_reason:
-      why_flagged_template: "Transaction volume exceeds expected maximum for customer profile type '{customer.customer_profile}'"
-      regulation: PMLA KYC Guidelines - Customer Risk Profiling
-      threshold_ref: derived.expected_max
-      actual_value_ref: txn.total_amount
+- id: AML-005
+  name: Profile Inconsistency
+  conditions:
+  - type: gt
+    path: txn.total_amount
+    value_ref: derived.expected_max
+  confidence: 0.82
+  observation_template: "INR {txn.total_amount} is inconsistent with '{customer.customer_profile}'
+    profile (expected max INR {derived.expected_max})"
+  audit_reason:
+    why_flagged_template: "Transaction volume exceeds expected maximum for customer
+      profile type '{customer.customer_profile}'"
+    regulation: PMLA KYC Guidelines - Customer Risk Profiling
+    threshold_ref: derived.expected_max
+    actual_value_ref: txn.total_amount
 
-  - id: AML-006
-    name: High Risk Jurisdiction Transfer
-    conditions:
-      - type: in_list
-        item_path: derived.destination
-        list_ref: high_risk_countries
-    confidence: 0.91
-    observation_template: "Funds transferred to {derived.destination}"
-    audit_reason:
-      why_flagged_template: "{derived.destination} appears on FATF high-risk jurisdiction list"
-      regulation: FATF High Risk Jurisdictions 2024
-      threshold: FATF_HIGH_RISK_COUNTRY_LIST
-      actual_value_ref: derived.destination
+- id: AML-006
+  name: High Risk Jurisdiction Transfer
+  conditions:
+  - type: in_list
+    item_path: derived.destination
+    list_ref: high_risk_countries
+  confidence: 0.91
+  observation_template: "Funds transferred to {derived.destination}"
+  audit_reason:
+    why_flagged_template: "{derived.destination} appears on FATF high-risk jurisdiction
+      list"
+    regulation: FATF High Risk Jurisdictions 2024
+    threshold: FATF_HIGH_RISK_COUNTRY_LIST
+    actual_value_ref: derived.destination
 
-  - id: AML-007
-    name: Rapid Fund Movement / Layering
-    conditions:
-      - type: le
-        path: txn.time_window_days
-        value_ref: thresholds.rapid_movement_days
-      - type: non_empty
-        path: derived.destination
-    confidence: 0.87
-    observation_template: "Funds received and transferred internationally within {txn.time_window_days} days"
-    audit_reason:
-      why_flagged_template: "International transfer within {txn.time_window_days} days of receipt - layering indicator"
-      regulation: FATF Recommendation 16 - Wire Transfers
-      threshold_ref: thresholds.rapid_movement_days
-      actual_value_ref: txn.time_window_days
+- id: AML-007
+  name: Rapid Fund Movement / Layering
+  conditions:
+  - type: le
+    path: txn.time_window_days
+    value_ref: thresholds.rapid_movement_days
+  - type: non_empty
+    path: derived.destination
+  confidence: 0.87
+  observation_template: "Funds received and transferred internationally within {txn.time_window_days}
+    days"
+  audit_reason:
+    why_flagged_template: "International transfer within {txn.time_window_days} days
+      of receipt - layering indicator"
+    regulation: FATF Recommendation 16 - Wire Transfers
+    threshold_ref: thresholds.rapid_movement_days
+    actual_value_ref: txn.time_window_days
 
-  - id: AML-008
-    name: Deposit Aggregation Then Transfer
-    conditions:
-      - type: contains_substring
-        path: derived.pattern_lower
-        substring: multiple deposits followed by international transfer
-    confidence: 0.85
-    observation_template: "Transaction pattern matches known AML typology: '{derived.pattern}'"
-    audit_reason:
-      why_flagged_template: "Pattern contains high-risk indicator keyword: 'multiple deposits followed by international transfer'"
-      regulation: FATF Typology Report 2023
-      threshold: PATTERN_KEYWORD_MATCH
-      actual_value_ref: derived.pattern
+- id: AML-008
+  name: Deposit Aggregation Then Transfer
+  conditions:
+  - type: contains_substring
+    path: derived.pattern_lower
+    substring: multiple deposits followed by international transfer
+  confidence: 0.85
+  observation_template: "Transaction pattern matches known AML typology: '{derived.pattern}'"
+  audit_reason:
+    why_flagged_template: "Pattern contains high-risk indicator keyword: 'multiple
+      deposits followed by international transfer'"
+    regulation: FATF Typology Report 2023
+    threshold: PATTERN_KEYWORD_MATCH
+    actual_value_ref: derived.pattern
 
-  - id: AML-009
-    name: Round Tripping
-    conditions:
-      - type: contains_substring
-        path: derived.pattern_lower
-        substring: round trip
-    confidence: 0.90
-    observation_template: "Transaction pattern matches known AML typology: '{derived.pattern}'"
-    audit_reason:
-      why_flagged_template: "Pattern contains high-risk indicator keyword: 'round trip'"
-      regulation: FATF Typology Report 2023
-      threshold: PATTERN_KEYWORD_MATCH
-      actual_value_ref: derived.pattern
+- id: AML-009
+  name: Round Tripping
+  conditions:
+  - type: contains_substring
+    path: derived.pattern_lower
+    substring: round trip
+  confidence: 0.90
+  observation_template: "Transaction pattern matches known AML typology: '{derived.pattern}'"
+  audit_reason:
+    why_flagged_template: "Pattern contains high-risk indicator keyword: 'round trip'"
+    regulation: FATF Typology Report 2023
+    threshold: PATTERN_KEYWORD_MATCH
+    actual_value_ref: derived.pattern
 
-  - id: AML-010
-    name: Cash Intensive Activity
-    conditions:
-      - type: contains_substring
-        path: derived.pattern_lower
-        substring: cash deposit
-    confidence: 0.75
-    observation_template: "Transaction pattern matches known AML typology: '{derived.pattern}'"
-    audit_reason:
-      why_flagged_template: "Pattern contains high-risk indicator keyword: 'cash deposit'"
-      regulation: FATF Typology Report 2023
-      threshold: PATTERN_KEYWORD_MATCH
-      actual_value_ref: derived.pattern
+- id: AML-010
+  name: Cash Intensive Activity
+  conditions:
+  - type: contains_substring
+    path: derived.pattern_lower
+    substring: cash deposit
+  confidence: 0.75
+  observation_template: "Transaction pattern matches known AML typology: '{derived.pattern}'"
+  audit_reason:
+    why_flagged_template: "Pattern contains high-risk indicator keyword: 'cash deposit'"
+    regulation: FATF Typology Report 2023
+    threshold: PATTERN_KEYWORD_MATCH
+    actual_value_ref: derived.pattern
 
-  - id: AML-011
-    name: Multi Account Layering
-    conditions:
-      - type: contains_substring
-        path: derived.pattern_lower
-        substring: multiple accounts
-    confidence: 0.83
-    observation_template: "Transaction pattern matches known AML typology: '{derived.pattern}'"
-    audit_reason:
-      why_flagged_template: "Pattern contains high-risk indicator keyword: 'multiple accounts'"
-      regulation: FATF Typology Report 2023
-      threshold: PATTERN_KEYWORD_MATCH
-      actual_value_ref: derived.pattern
+- id: AML-011
+  name: Multi Account Layering
+  conditions:
+  - type: contains_substring
+    path: derived.pattern_lower
+    substring: multiple accounts
+  confidence: 0.83
+  observation_template: "Transaction pattern matches known AML typology: '{derived.pattern}'"
+  audit_reason:
+    why_flagged_template: "Pattern contains high-risk indicator keyword: 'multiple
+      accounts'"
+    regulation: FATF Typology Report 2023
+    threshold: PATTERN_KEYWORD_MATCH
+    actual_value_ref: derived.pattern
 
-  - id: AML-012
-    name: Confirmed Structuring Pattern
-    conditions:
-      - type: contains_substring
-        path: derived.pattern_lower
-        substring: structuring
-    confidence: 0.92
-    observation_template: "Transaction pattern matches known AML typology: '{derived.pattern}'"
-    audit_reason:
-      why_flagged_template: "Pattern contains high-risk indicator keyword: 'structuring'"
-      regulation: FATF Typology Report 2023
-      threshold: PATTERN_KEYWORD_MATCH
-      actual_value_ref: derived.pattern
+- id: AML-012
+  name: Confirmed Structuring Pattern
+  conditions:
+  - type: contains_substring
+    path: derived.pattern_lower
+    substring: structuring
+  confidence: 0.92
+  observation_template: "Transaction pattern matches known AML typology: '{derived.pattern}'"
+  audit_reason:
+    why_flagged_template: "Pattern contains high-risk indicator keyword: 'structuring'"
+    regulation: FATF Typology Report 2023
+    threshold: PATTERN_KEYWORD_MATCH
+    actual_value_ref: derived.pattern
 
-  - id: AML-013
-    name: Account Type Mismatch
-    conditions:
-      - type: eq
-        path: customer.account_type
-        value: Savings
-      - type: gt
-        path: txn.transaction_count
-        value: 15
-    confidence: 0.78
-    observation_template: "Savings account used for {txn.transaction_count} high-volume transactions"
-    audit_reason:
-      why_flagged_template: "High volume transactions in savings account suggest undisclosed business activity"
-      regulation: RBI KYC Master Direction - Account Usage Monitoring
-      threshold: 15
-      actual_value_ref: txn.transaction_count
+- id: AML-013
+  name: Account Type Mismatch
+  conditions:
+  - type: eq
+    path: customer.account_type
+    value: Savings
+  - type: gt
+    path: txn.transaction_count
+    value: 15
+  confidence: 0.78
+  observation_template: "Savings account used for {txn.transaction_count} high-volume
+    transactions"
+  audit_reason:
+    why_flagged_template: "High volume transactions in savings account suggest undisclosed
+      business activity"
+    regulation: RBI KYC Master Direction - Account Usage Monitoring
+    threshold: 15
+    actual_value_ref: txn.transaction_count

@@ -123,6 +123,7 @@ def mask_alert(alert: dict[str, Any]) -> dict[str, Any]:
     masked["customer_name"] = mask_name(masked.get("customer_name"))
     masked["customer_id"]   = mask_identifier(masked.get("customer_id"))
     masked.pop("_enrichment_context", None)
+    masked.pop("_registry_config", None)
     return masked
 
 
@@ -285,11 +286,19 @@ class SarRagService:
         return narrative
 
     def process_alert(self, alert: dict[str, Any]) -> dict[str, Any]:
+        # Guard: convert Pydantic model to dict if needed
+        if hasattr(alert, "model_dump"):
+            alert = alert.model_dump()
+
         case_started_at = utc_now()
         masked_alert = mask_alert(alert)
         audit_events: list[dict[str, Any]] = [{
             "event_type": "CASE_INGESTED",
-            "payload": {"alert_id": alert["alert_id"], "masked_alert": masked_alert, "timestamp": case_started_at},
+            "payload": {
+                "alert_id": alert["alert_id"],
+                "masked_alert": masked_alert,
+                "timestamp": case_started_at,
+            },
         }]
 
         evidence_blocks = evaluate_rules(alert)
@@ -297,88 +306,131 @@ class SarRagService:
         evidence_pack = self._build_evidence_pack(alert, evidence_blocks, risk_score, risk_level)
         audit_events.append({
             "event_type": "RULES_EVALUATED",
-            "payload": {"risk_score": risk_score, "risk_level": risk_level,
-                        "rule_count": len(evidence_blocks), "evidence_blocks": evidence_blocks},
+            "payload": {
+                "risk_score": risk_score,
+                "risk_level": risk_level,
+                "rule_count": len(evidence_blocks),
+                "evidence_blocks": evidence_blocks,
+            },
         })
 
         if not evidence_blocks:
             final_sar = {
-                "customer_name": alert["customer_name"], "customer_id": alert["customer_id"],
-                "account_type": alert["account_type"], "alert_id": alert["alert_id"],
-                "alert_type": alert["alert_type"], "risk_score": risk_score, "risk_level": risk_level,
-                "rules_triggered": 0, "narrative": "No suspicious activity threshold was met. Case closed.",
-                "generated_at": utc_now(), "status": "NO_SAR_REQUIRED",
+                "customer_name": alert.get("customer_name") or "N/A",
+                "customer_id":   alert["customer_id"],
+                "account_type":  alert.get("account_type") or "unknown",
+                "alert_id":      alert["alert_id"],
+                "alert_type":    alert["alert_type"],
+                "risk_score":    risk_score,
+                "risk_level":    risk_level,
+                "rules_triggered": 0,
+                "narrative": "No suspicious activity threshold was met. Case closed.",
+                "generated_at": utc_now(),
+                "status": "NO_SAR_REQUIRED",
             }
             return {
-                "status": "NO_SAR_REQUIRED", "masked_alert": masked_alert,
-                "risk_score": risk_score, "risk_level": risk_level,
-                "evidence_pack": evidence_pack, "retrieval_payload": {}, "prompt_payload": {},
-                "validation_payload": {"passed": True,
-                    "checks": [{"name": "no_rules_triggered", "passed": True, "details": "No AML rules fired."}],
-                    "failed_checks": []},
-                "final_sar": final_sar, "analyst_traceability": [], "audit_events": audit_events,
+                "status": "NO_SAR_REQUIRED",
+                "masked_alert": masked_alert,
+                "risk_score": risk_score,
+                "risk_level": risk_level,
+                "evidence_pack": evidence_pack,
+                "retrieval_payload": {},
+                "prompt_payload": {},
+                "validation_payload": {
+                    "passed": True,
+                    "checks": [{"name": "no_rules_triggered", "passed": True,
+                                "details": "No AML rules fired."}],
+                    "failed_checks": [],
+                },
+                "final_sar": final_sar,
+                "analyst_traceability": [],
+                "audit_events": audit_events,
             }
 
         query = build_rag_query(evidence_blocks, masked_alert)
-        retrieval_payload = self._retrieve_context(query)
-        audit_events.append({"event_type": "RAG_RETRIEVAL_COMPLETED", "payload": retrieval_payload})
+        # BUG #1 FIX: retrieve with unmasked alert so domain routing works
+        retrieval_payload = self._retrieve_context(query, alert)
+        audit_events.append({
+            "event_type": "RAG_RETRIEVAL_COMPLETED",
+            "payload": retrieval_payload,
+        })
 
+        # BUG #1 FIX: pass unmasked alert to prompt builder
+        # _enrichment_context is present in alert but stripped from masked_alert
+        # mask_alert() is only used for audit storage, never for prompt building
         prompt_payload = self._build_prompt_bundle(alert, evidence_blocks, retrieval_payload)
         narrative = self._generate_narrative(alert, prompt_payload)
         validation_payload = self._validate_narrative(alert, narrative)
 
-        pii_check = next((c for c in validation_payload["checks"] if c["name"] == "no_pii_exposed"), None)
+        pii_check = next(
+            (c for c in validation_payload["checks"] if c["name"] == "no_pii_exposed"),
+            None,
+        )
         if pii_check and not pii_check["passed"]:
             raise RuntimeError("HARD BLOCK: PII detected in generated narrative. Case not stored.")
 
         sentence_traceability = self._build_sentence_traceability(
-            narrative, evidence_blocks, retrieval_payload["documents"])
+            narrative, evidence_blocks, retrieval_payload["documents"]
+        )
 
         final_sar = {
-            "customer_name": alert["customer_name"], "customer_id": alert["customer_id"],
-            "account_type": alert["account_type"], "alert_id": alert["alert_id"],
-            "alert_type": alert["alert_type"], "risk_score": risk_score, "risk_level": risk_level,
-            "rules_triggered": len(evidence_blocks), "narrative": narrative,
+            "customer_name": alert.get("customer_name") or "N/A",
+            "customer_id":   alert["customer_id"],
+            "account_type":  alert.get("account_type") or "unknown",
+            "alert_id":      alert["alert_id"],
+            "alert_type":    alert["alert_type"],
+            "risk_score":    risk_score,
+            "risk_level":    risk_level,
+            "rules_triggered": len(evidence_blocks),
+            "narrative":     narrative,
             "sentence_traceability": sentence_traceability,
-            "generated_at": utc_now(), "status": "PENDING_ANALYST_REVIEW",
+            "generated_at":  utc_now(),
+            "status":        "PENDING_ANALYST_REVIEW",
         }
 
         audit_events.extend([
             {"event_type": "LLM_GENERATION_COMPLETED", "payload": {
-                "model_name": self.model_name, "model_options": prompt_payload["model_options"],
+                "model_name":     self.model_name,
+                "model_options":  prompt_payload["model_options"],
                 "prompt_version": prompt_payload["prompt_version"],
                 "prompt_sha256": prompt_payload["prompt_sha256"],
-                "prompt_sha": prompt_payload["prompt_sha"]}},
+                "prompt_sha":     prompt_payload["prompt_sha"],
+            }},
             {"event_type": "VALIDATION_COMPLETED", "payload": validation_payload},
             {"event_type": "SENTENCE_TRACEABILITY_COMPLETED", "payload": {
                 "total_sentences": len(sentence_traceability),
                 "flagged_count": sum(1 for s in sentence_traceability if s["flagged_for_review"]),
-                "source_type_breakdown": {
-                    t: sum(1 for s in sentence_traceability if s["source"]["type"] == t)
-                    for t in ("rule", "transaction", "document", "unmatched")}}},
+            }},
             {"event_type": "CASE_READY_FOR_REVIEW", "payload": {
-                "status": "PENDING_ANALYST_REVIEW", "generated_at": final_sar["generated_at"]}},
+                "status": "PENDING_ANALYST_REVIEW",
+                "generated_at": final_sar["generated_at"],
+            }},
         ])
 
         return {
-            "status": "PENDING_ANALYST_REVIEW", "masked_alert": masked_alert,
-            "risk_score": risk_score, "risk_level": risk_level,
-            "evidence_pack": evidence_pack, "retrieval_payload": retrieval_payload,
-            "prompt_payload": prompt_payload, "validation_payload": validation_payload,
-            "final_sar": final_sar, "analyst_traceability": sentence_traceability,
+            "status": "PENDING_ANALYST_REVIEW",
+            "masked_alert": masked_alert,
+            "risk_score": risk_score,
+            "risk_level": risk_level,
+            "evidence_pack": evidence_pack,
+            "retrieval_payload": retrieval_payload,
+            "prompt_payload": prompt_payload,
+            "validation_payload": validation_payload,
+            "final_sar": final_sar,
+            "analyst_traceability": sentence_traceability,
             "audit_events": audit_events,
         }
 
     def replay_case(self, case_record: dict[str, Any]) -> dict[str, Any]:
         prompt_payload = case_record.get("prompt_payload") or {}
         if not prompt_payload:
-            return {"replayed": False, "reason": "Prompt payload unavailable.", "replayed_at": utc_now()}
-        raw = self._chat_with_fallback(
-            model_name=prompt_payload.get("model_name", self.model_name),
-            system_prompt=prompt_payload["system_prompt"],
-            user_prompt=prompt_payload["user_prompt"],
-            model_options=prompt_payload.get("model_options", {"num_ctx": 2048, "temperature": 0.2, "top_p": 0.9}),
-        )
+            return {
+                "replayed": False,
+                "reason": "Prompt payload unavailable.",
+                "replayed_at": utc_now(),
+            }
+
+        # BUG #7 FIX: safe access with fallback
         alert_payload = case_record.get("alert_payload") or {}
         if not alert_payload:
             return {
@@ -386,6 +438,13 @@ class SarRagService:
                 "reason": "alert_payload missing from case record.",
                 "replayed_at": utc_now(),
             }
+
+        raw = self._chat_with_fallback(
+            model_name=prompt_payload.get("model_name", self.model_name),
+            system_prompt=prompt_payload["system_prompt"],
+            user_prompt=prompt_payload["user_prompt"],
+            model_options=prompt_payload.get("model_options", {"num_ctx": 2048, "temperature": 0.2, "top_p": 0.9}),
+        )
         replay_narrative = self._post_process_narrative(raw["message"]["content"], alert_payload)
         original_narrative = case_record.get("final_sar", {}).get("narrative", "")
         return {
@@ -395,24 +454,87 @@ class SarRagService:
             "raw_response": raw,
         }
 
-    def _retrieve_context(self, query: str, n_results: int = 5) -> dict[str, Any]:
+    def _retrieve_context(
+        self,
+        query: str,
+        alert: dict[str, Any] | None = None,
+        n_results: int = 5,
+    ) -> dict[str, Any]:
+        """
+        Domain-aware retrieval.
+        Queries domain-specific collection first, then shared collection.
+        Falls back to legacy sar_knowledge if domain collection not found.
+        """
         model = get_embedding_model()
-        collection = get_collection()
         query_embedding = model.encode([query])
-        results = collection.query(query_embeddings=query_embedding, n_results=n_results)
-        snapshot = {"snapshot_id": collection.name, "total_docs": collection.count(), "captured_at": utc_now()}
-        documents = []
-        for index, document in enumerate(results["documents"][0]):
-            distance = float(results["distances"][0][index])
-            documents.append({
-                "id": results["ids"][0][index],
-                "document": document[:RAG_CHUNK_MAX_CHARS],
-                "distance": distance,
-                "similarity_score": round(max(0.0, 1 - distance), 4),
-                "metadata": results["metadatas"][0][index],
-            })
-        return {"query_used": query, "documents": documents,
-                "corpus_snapshot": snapshot, "retrieval_timestamp": utc_now()}
+
+        asset_type = (alert or {}).get("asset_type", "FIAT_WIRE")
+        domain_collection_name = f"sar_knowledge_{asset_type.lower()}"
+        shared_collection_name = "sar_knowledge_all"
+        legacy_collection_name = "sar_knowledge"
+
+        client = chromadb.PersistentClient(path=str(VECTOR_DB_PATH))
+        documents: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+
+        def _query_collection(col_name: str, n: int) -> list[dict[str, Any]]:
+            try:
+                col = client.get_collection(col_name)
+                results = col.query(
+                    query_embeddings=query_embedding, n_results=n
+                )
+                items = []
+                for idx, doc in enumerate(results["documents"][0]):
+                    doc_id = results["ids"][0][idx]
+                    if doc_id in seen_ids:
+                        continue
+                    seen_ids.add(doc_id)
+                    distance = float(results["distances"][0][idx])
+                    items.append({
+                        "id": doc_id,
+                        "document": doc[:RAG_CHUNK_MAX_CHARS],
+                        "distance": distance,
+                        "similarity_score": round(max(0.0, 1 - distance), 4),
+                        "metadata": results["metadatas"][0][idx],
+                        "collection": col_name,
+                    })
+                return items
+            except Exception:
+                return []
+
+        # Domain-specific first (3 results)
+        if asset_type != "FIAT_WIRE":
+            domain_docs = _query_collection(domain_collection_name, 3)
+            documents.extend(domain_docs)
+
+        # Shared collection (remaining slots)
+        remaining = n_results - len(documents)
+        if remaining > 0:
+            shared_docs = _query_collection(shared_collection_name, remaining)
+            documents.extend(shared_docs)
+
+        # Legacy fallback if still empty
+        if not documents:
+            documents = _query_collection(legacy_collection_name, n_results)
+
+        try:
+            snapshot_col = client.get_collection(
+                shared_collection_name if documents else legacy_collection_name
+            )
+            snapshot = {
+                "snapshot_id": snapshot_col.name,
+                "total_docs": snapshot_col.count(),
+                "captured_at": utc_now(),
+            }
+        except Exception:
+            snapshot = {"snapshot_id": "unknown", "total_docs": 0, "captured_at": utc_now()}
+
+        return {
+            "query_used": query,
+            "documents": documents,
+            "corpus_snapshot": snapshot,
+            "retrieval_timestamp": utc_now(),
+        }
 
     def _build_evidence_pack(self, alert: dict[str, Any], evidence_blocks: list[dict[str, Any]],
                               risk_score: float, risk_level: str) -> dict[str, Any]:
@@ -435,8 +557,8 @@ class SarRagService:
         txn = alert["transactions"]
         avg_amount = round(txn["total_amount"] / txn["transaction_count"])
         details = {
-            "alert_type": alert["alert_type"], "account_type": alert["account_type"],
-            "customer_profile": alert["customer_profile"],
+            "alert_type": alert["alert_type"], "account_type": alert.get("account_type") or "unknown",
+            "customer_profile": alert.get("customer_profile") or "Unknown",
             "transaction_count": txn["transaction_count"], "total_amount": txn["total_amount"],
             "time_window_days": txn["time_window_days"],
             "average_transaction_amount": avg_amount,
@@ -463,6 +585,15 @@ class SarRagService:
                               retrieval_payload: dict[str, Any]) -> dict[str, Any]:
         td = self._build_transaction_details(alert)
         financials = self._build_financials_block(alert)
+
+        # Domain-aware regulation context
+        registry = alert.get("_registry_config") or {}
+        domain_config = registry.get(alert.get("asset_type", "FIAT_WIRE"), {})
+        conclusion_regulation = domain_config.get(
+            "conclusion_regulation",
+            "PMLA Section 12 and Rule 3 of PMLA (Maintenance of Records) Rules 2005",
+        )
+        domain_prompt_context = domain_config.get("additional_prompt_context", "")
 
         enrichment_ctx = alert.get("_enrichment_context") or {}
         unique_cps = enrichment_ctx.get("unique_counterparties_count")
@@ -540,6 +671,44 @@ class SarRagService:
                 f"- Alert Window                          : {date_start} to {date_end}",
             ]
 
+        customer_background = alert.get("_customer_background") or {}
+        bg_lines: list[str] = []
+        if customer_background:
+            prior_sar_count = customer_background.get("prior_sar_count", 0)
+            is_repeat = customer_background.get("is_repeat_sar_customer", False)
+            rel_years = customer_background.get("relationship_years")
+            kyc_rating = customer_background.get("kyc_risk_rating", "LOW")
+            pep_flag = customer_background.get("pep_flag", False)
+            adverse_media = customer_background.get("adverse_media_flag", False)
+            alert_types = customer_background.get("alert_types_seen") or []
+            countries = customer_background.get("countries_involved") or []
+
+            bg_lines = ["Customer Background (use in Paragraph 1 context only):"]
+            if is_repeat and prior_sar_count > 0:
+                bg_lines.append(
+                    f"- PRIOR SAR HISTORY: {prior_sar_count} SAR(s) previously filed against this account holder."
+                )
+                if alert_types:
+                    bg_lines.append(f"- Previous alert types: {', '.join(alert_types)}")
+                if countries:
+                    bg_lines.append(f"- Countries previously involved: {', '.join(countries)}")
+            else:
+                bg_lines.append("- No prior SAR history for this account holder.")
+
+            if rel_years is not None:
+                bg_lines.append(f"- Bank relationship duration: {rel_years} years")
+
+            bg_lines.append(f"- KYC Risk Rating: {kyc_rating}")
+
+            if pep_flag:
+                bg_lines.append(
+                    "- IMPORTANT: Account holder is a Politically Exposed Person (PEP)."
+                )
+            if adverse_media:
+                bg_lines.append(
+                    "- IMPORTANT: Adverse media flag is active for this account holder."
+                )
+
         deviation_str = (
             f"{financials['deviation_from_baseline_pct']}%"
             if financials and "deviation_from_baseline_pct" in financials
@@ -584,9 +753,10 @@ Name each rule: {jurisdiction_rules if jurisdiction_rules else "(none)"}.
 Do NOT include: PMLA, filing decision, enhanced monitoring.
 
 PARAGRAPH 5 — Conclusion (3-5 sentences):
-State: activity determined suspicious, SAR filed under PMLA Section 12 and Rule 3
-of PMLA (Maintenance of Records) Rules 2005, enhanced monitoring placed,
-related accounts flagged, FIU escalated, source of funds requested.
+State: activity determined suspicious, SAR filed under {conclusion_regulation},
+enhanced monitoring placed, related accounts flagged, FIU escalated,
+source of funds requested.
+{"IMPORTANT: " + domain_prompt_context if domain_prompt_context else ""}
 Do NOT include: customer name, customer ID, transaction amounts, rule names."""
 
         user_prompt = "\n".join([
@@ -595,6 +765,7 @@ Do NOT include: customer name, customer ID, transaction amounts, rule names."""
             *txn_lines,
             *fin_lines,
             *(enrichment_lines if enrichment_lines else []),
+            *(bg_lines if bg_lines else []),
             "",
             "Triggered AML Rules:",
             evidence_summary,
@@ -652,13 +823,13 @@ Do NOT include: customer name, customer ID, transaction amounts, rule names."""
             "[Customer Name]": "the account holder",
             "[CUSTOMER ID]": "",
             "[ACCOUNT NUMBER]": "",
-            "[ACCOUNT TYPE]": alert["account_type"],
+            "[ACCOUNT TYPE]": alert.get("account_type") or "account",
             "[ALERT DATE]": "the monitoring period",
             "[START DATE]": "the monitoring period",
             "[END DATE]": "the monitoring period",
             "[APPLICABLE REGULATION]": "PMLA Section 12",
         }.items():
-            cleaned = cleaned.replace(placeholder, replacement)
+            cleaned = cleaned.replace(placeholder, str(replacement))
 
         customer_name = alert.get("customer_name", "")
         customer_id   = alert.get("customer_id", "")
@@ -757,6 +928,9 @@ Do NOT include: customer name, customer ID, transaction amounts, rule names."""
                 allowed_numbers |= _normalise_amount_for_allowed_set(v)
 
         narrative_lower     = narrative.lower()
+        customer_name_lower = str(alert.get("customer_name") or "").lower()
+        customer_id_lower   = str(alert.get("customer_id") or "").lower()
+        alert_type_lower    = str(alert.get("alert_type") or "").lower()
         found_vague         = [w for w in VAGUE_WORDS if re.search(rf"\b{w}\b", narrative_lower)]
         has_annotation_tags = bool(ANNOTATION_TAGS.search(narrative))
         has_bucket_names    = bool(ENRICHMENT_BUCKET_NAMES.search(narrative))
@@ -768,13 +942,13 @@ Do NOT include: customer name, customer ID, transaction amounts, rule names."""
             {"name": "word_count_range", "passed": 200 <= len(words) <= 460,
              "details": f"Narrative contains {len(words)} words."},
             {"name": "no_pii_exposed",
-             "passed": (alert["customer_name"].lower() not in narrative.lower()
-                        and alert["customer_id"].lower() not in narrative.lower()),
+             "passed": ((not customer_name_lower or customer_name_lower not in narrative_lower)
+                        and (not customer_id_lower or customer_id_lower not in narrative_lower)),
              "details": "Customer name and ID absent from narrative."},
             {"name": "no_placeholders", "passed": re.search(r"\[[^\]]+\]", narrative) is None,
              "details": "No unresolved placeholders."},
-            {"name": "correct_typology_used", "passed": alert["alert_type"].lower() in narrative.lower(),
-             "details": f"Narrative references typology: {alert['alert_type']}."},
+            {"name": "correct_typology_used", "passed": (alert_type_lower in narrative_lower if alert_type_lower else False),
+             "details": f"Narrative references typology: {alert.get('alert_type')} ."},
             {"name": "no_bullet_formatting",
              "passed": not re.search(r"(^\s*[\*\-•]\s|\n\s*[\*\-•]\s)", narrative),
              "details": "Narrative is paragraph prose."},
