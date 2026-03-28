@@ -5,6 +5,14 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 
+# ════════════════════════════════════════════════════════
+# ALERT PAYLOAD SCHEMAS
+# customer_financials is now OPTIONAL — enrichment.py
+# fetches it from PostgreSQL using customer_id.
+# If the caller provides it manually it is used as-is
+# (backward-compatible with existing alert_case.json files).
+# ════════════════════════════════════════════════════════
+
 class Transactions(BaseModel):
     transaction_count: int
     total_amount: float
@@ -16,9 +24,15 @@ class Transactions(BaseModel):
 
 
 class CustomerFinancials(BaseModel):
+    """
+    Populated by enrichment.py from PostgreSQL at case creation time.
+    Can also be provided directly in the alert payload for backward
+    compatibility or when enrichment data is unavailable.
+    """
     declared_monthly_income: float | None = None
     avg_monthly_deposits_12m: float | None = None
     historical_baseline_txn_count: int | None = None
+    deviation_from_baseline_pct: float | None = None
 
 
 class AlertPayload(BaseModel):
@@ -31,9 +45,20 @@ class AlertPayload(BaseModel):
     customer_profile: str
     alert_type: str
     transactions: Transactions
-    customer_financials: CustomerFinancials | None = None
     pattern: str
 
+    # Populated by enrichment at runtime — not required in alert JSON
+    customer_financials: CustomerFinancials | None = None
+
+    # TMS detection window — prevents late-filing date drift in enrichment
+    # If not provided, enrichment falls back to latest DB transaction as anchor
+    alert_window_start: str | None = None
+    alert_window_end: str | None = None
+
+
+# ════════════════════════════════════════════════════════
+# ANALYST REVIEW
+# ════════════════════════════════════════════════════════
 
 class ReviewRequest(BaseModel):
     analyst_id: str = Field(min_length=2)
@@ -41,6 +66,10 @@ class ReviewRequest(BaseModel):
     comment: str = Field(min_length=10)
     edited_narrative: str | None = None
 
+
+# ════════════════════════════════════════════════════════
+# REPLAY RESPONSE
+# ════════════════════════════════════════════════════════
 
 class ReplayResponse(BaseModel):
     replayed: bool

@@ -1,21 +1,18 @@
 {
   "alert_id": "ALERT_7821",
-  "customer_id": "CUST_445",
-  "customer_name": "Priya Sharma",
-  "account_type": "Current",
-  "customer_profile": "Salaried employee",
+  "customer_id": "CUST_1001",
+  "customer_name": "Arjun Malhotra",
+  "account_type": "current",
+  "customer_profile": "Student",
   "alert_type": "Layering",
+  "pattern": "multiple accounts round trip layering structuring",
+  "alert_window_start": "2026-03-24T00:00:00Z",
+  "alert_window_end": "2026-03-26T23:59:59Z",
   "transactions": {
-    "transaction_count": 28,
-    "total_amount": 1450000,
+    "transaction_count": 57,
+    "total_amount": 1623211.99,
     "time_window_days": 3,
     "destination_country": "UAE",
     "reporting_threshold": 1000000
-  },
-  "customer_financials": {
-    "declared_monthly_income": 45000,
-    "avg_monthly_deposits_12m": 38000,
-    "historical_baseline_txn_count": 4
-  },
-  "pattern": "multiple accounts round trip layering structuring"
+  }
 }

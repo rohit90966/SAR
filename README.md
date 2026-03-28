@@ -6,6 +6,7 @@ AI-assisted Suspicious Activity Report (SAR) drafting system with:
 - Retrieval-Augmented Generation (RAG) over compliance knowledge
 - FastAPI backend with JWT authentication
 - PostgreSQL persistence for cases and audit trail
+- PostgreSQL-backed KYC enrichment for safer, evidence-grounded narratives
 - Plain HTML/CSS/JS analyst interface
 - PDF export for finalized case reports
 
@@ -14,24 +15,28 @@ AI-assisted Suspicious Activity Report (SAR) drafting system with:
 This repository is production-style and end-to-end runnable locally.
 
 - Rule engine, RAG retrieval, narrative generation, and validation are implemented.
+- DB-backed enrichment is implemented with strict safe-stats vs PII-sealed separation.
 - Analyst review, replay, and audit logging are implemented.
 - PDF export endpoint is implemented.
-- A pytest suite exists for critical API flows.
+- Seed data utility is included for realistic customer/account/transaction history.
+- A pytest suite exists for API flows and SAR safety/guardrail checks.
 
 ## End-to-End Flow
 
 For each incoming alert (`POST /cases`):
 
 1. Authenticate request via JWT bearer token.
-2. Evaluate AML rules from `rules.yaml` and compute risk score + level.
-3. Mask sensitive fields before retrieval.
-4. Retrieve supporting context from ChromaDB.
-5. Generate SAR narrative with local Ollama model.
-6. Validate narrative quality and compliance checks.
-7. Score sentence-level explainability against retrieved evidence.
-8. Persist case state and audit events in PostgreSQL.
-9. Support analyst approve/reject and narrative edits.
-10. Support replay and PDF export for archival.
+2. Create initial case record in PostgreSQL.
+3. Enrich alert with KYC and transaction-derived safe stats from PostgreSQL.
+4. Evaluate AML rules from `rules.yaml` and compute risk score + level.
+5. Mask sensitive fields before retrieval.
+6. Retrieve supporting context from ChromaDB.
+7. Generate SAR narrative with local Ollama model.
+8. Validate narrative quality and compliance checks.
+9. Score sentence-level explainability against retrieved evidence.
+10. Persist case state and audit events in PostgreSQL.
+11. Support analyst approve/reject and narrative edits.
+12. Support replay and PDF export for archival.
 
 ## Repository Layout
 
@@ -44,6 +49,7 @@ barclays/
 |-- backend/
 |   |-- app.py
 |   |-- database.py
+|   |-- enrichment.py
 |   `-- schemas.py
 |-- data/
 |   |-- alert_case.json
@@ -68,11 +74,29 @@ barclays/
 |   `-- vector_db/
 |-- scripts/
 |   |-- ensure_local_postgres.py
+|   |-- seed_data.py
 |   `-- calculate_llm_tokens.py
 |-- tests/
-|   `-- test_backend.py
+|   |-- test_backend.py
+|   `-- test_sar_safety.py
 `-- vector_db/
 ```
+
+## Important Files
+
+- `rag_pipeline/pipeline_service.py`: Core orchestration for SAR generation (prompt building, LLM call, post-processing, validation, sentence traceability).
+- `rag_pipeline/rule_engine.py`: Deterministic AML rule evaluation, risk scoring, and retrieval query construction.
+- `backend/app.py`: FastAPI application with authentication, case lifecycle endpoints, replay, and PDF export routes.
+- `backend/database.py`: PostgreSQL connection handling and persistence helpers for cases and audit events.
+- `backend/enrichment.py`: Fetches customer/account/transaction history and computes safe enrichment stats from PostgreSQL.
+- `backend/schemas.py`: Pydantic request/response models used by API routes.
+- `rules.yaml`: Primary AML rules configuration (conditions, confidence, observations, regulatory mapping).
+- `data/alert_case.json`: Canonical sample alert payload for local runs and debugging.
+- `rag_pipeline/ingestion_pipeline.py`: Builds/refreshes Chroma vector store from AML knowledge files.
+- `scripts/ensure_local_postgres.py`: Creates/verifies local PostgreSQL database required by the API.
+- `scripts/seed_data.py`: Seeds realistic customers, accounts, and transactions for enrichment and demo scenarios.
+- `tests/test_backend.py`: API integration tests for login, auth, case creation, review, and PDF export.
+- `tests/test_sar_safety.py`: Safety and narrative-guardrail tests for SAR output quality/compliance.
 
 ## API Summary
 
@@ -148,7 +172,13 @@ Important: if your local PostgreSQL password is not `root`, update `DATABASE_URL
 python scripts/ensure_local_postgres.py
 ```
 
-### 4) Ensure Ollama model is available
+### 4) Seed enrichment data (recommended)
+
+```bash
+python scripts/seed_data.py
+```
+
+### 5) Ensure Ollama model is available
 
 ```bash
 ollama pull mistral:7b
@@ -157,7 +187,7 @@ ollama serve
 
 If `mistral:7b` is heavy for your machine, you can swap `OLLAMA_MODEL` in `.env` to a smaller local model.
 
-### 5) Build or refresh vector store
+### 6) Build or refresh vector store
 
 ```bash
 cd rag_pipeline
@@ -165,7 +195,7 @@ python ingestion_pipeline.py
 cd ..
 ```
 
-### 6) Start backend
+### 7) Start backend
 
 ```bash
 uvicorn backend.app:app --reload
@@ -174,7 +204,7 @@ uvicorn backend.app:app --reload
 - API: `http://localhost:8000`
 - Swagger UI: `http://localhost:8000/docs`
 
-### 7) Start frontend
+### 8) Start frontend
 
 ```bash
 cd frontend
@@ -189,6 +219,7 @@ python -m http.server 8080
 conda activate rag
 copy .env.example .env
 python scripts/ensure_local_postgres.py
+python scripts/seed_data.py
 
 Start-Process powershell -ArgumentList '-NoExit', '-Command', 'ollama serve'
 ollama pull mistral:7b
@@ -235,6 +266,7 @@ Run:
 
 ```bash
 pytest -q tests/test_backend.py
+pytest -q tests/test_sar_safety.py
 ```
 
 Coverage includes:
@@ -260,6 +292,7 @@ Coverage includes:
 
 - `401 Missing Bearer token`: obtain JWT from `POST /login` and pass `Authorization: Bearer <token>`.
 - `Connection refused` to PostgreSQL: verify DB service is running, then re-run `python scripts/ensure_local_postgres.py`.
+- `UndefinedColumn` errors on `/cases`: your DB schema may be older than code; restart backend to trigger startup `init_db()` migration.
 - Empty/weak retrieval: re-run `python rag_pipeline/ingestion_pipeline.py` to refresh embeddings.
 - Ollama generation failures: ensure `ollama serve` is running and model is pulled.
 
